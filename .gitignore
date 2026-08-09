@@ -1,0 +1,22 @@
+# macOS
+.DS_Store
+.AppleDouble
+.LSOverride
+._*
+.Spotlight-V100
+.Trashes
+
+# Swift Package Manager
+.build/
+.swiftpm/
+Package.resolved
+
+# Xcode
+xcuserdata/
+*.xcuserstate
+DerivedData/
+
+# Build output — produced by Tools/make-app.sh
+HoloFrame.app/
+# Design/HoloFrame.icns IS committed: make-app.sh can rebuild it via qlmanage,
+# but that path depends on QuickLook SVG rendering and is not worth trusting.

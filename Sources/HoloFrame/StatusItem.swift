@@ -13,11 +13,14 @@ final class StatusItem {
 
     private let item: NSStatusItem
     private let statusLine = NSMenuItem(title: "", action: nil, keyEquivalent: "")
+    private let accessibilityItem = NSMenuItem(title: "Enable Pinch Zoom…",
+                                               action: nil, keyEquivalent: "")
 
     /// Actions are supplied by main, which owns the tracker and the display.
     init(recenter: @escaping () -> Void,
          recalibrate: @escaping () -> Void,
          settings: @escaping () -> Void,
+         grantAccessibility: @escaping () -> Void,
          quit: @escaping () -> Void) {
         item = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
         item.button?.image = NSImage(systemSymbolName: "eyeglasses",
@@ -39,12 +42,20 @@ final class StatusItem {
                                 action: #selector(Target.settings), keyEquivalent: ","))
         menu.addItem(NSMenuItem(title: "Recalibrate Head Tracking…",
                                 action: #selector(Target.recalibrate), keyEquivalent: ""))
+
+        // Only shown when the permission is actually missing. An always-present entry for
+        // something already granted is just a thing to wonder about.
+        accessibilityItem.action = #selector(Target.grantAccessibility)
+        accessibilityItem.isHidden = true
+        menu.addItem(accessibilityItem)
+
         menu.addItem(.separator())
         menu.addItem(NSMenuItem(title: "Quit HoloFrame",
                                 action: #selector(Target.quit), keyEquivalent: "q"))
 
         let target = Target(recenter: recenter, recalibrate: recalibrate,
-                            settings: settings, quit: quit)
+                            settings: settings, grantAccessibility: grantAccessibility,
+                            quit: quit)
         for entry in menu.items where entry.action != nil {
             entry.target = target
         }
@@ -59,26 +70,35 @@ final class StatusItem {
         statusLine.title = text
     }
 
+    /// Offer the Accessibility prompt only while it would achieve something.
+    func setPinchZoomAvailable(_ available: Bool) {
+        accessibilityItem.isHidden = available
+    }
+
     /// NSMenuItem needs an ObjC target; closures cannot be selectors.
     private final class Target: NSObject {
         private let recenterAction: () -> Void
         private let recalibrateAction: () -> Void
         private let settingsAction: () -> Void
+        private let grantAccessibilityAction: () -> Void
         private let quitAction: () -> Void
 
         init(recenter: @escaping () -> Void,
              recalibrate: @escaping () -> Void,
              settings: @escaping () -> Void,
+             grantAccessibility: @escaping () -> Void,
              quit: @escaping () -> Void) {
             self.recenterAction = recenter
             self.recalibrateAction = recalibrate
             self.settingsAction = settings
+            self.grantAccessibilityAction = grantAccessibility
             self.quitAction = quit
         }
 
         @objc func recenter() { recenterAction() }
         @objc func recalibrate() { recalibrateAction() }
         @objc func settings() { settingsAction() }
+        @objc func grantAccessibility() { grantAccessibilityAction() }
         @objc func quit() { quitAction() }
     }
 }

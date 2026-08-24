@@ -56,25 +56,37 @@ open -a HoloFrame.app --stdout /tmp/holoframe.log --stderr /tmp/holoframe.log
 
 ### Code signing
 
-`make-app.sh` signs ad-hoc unless told otherwise, which gives the bundle a **fresh code
-hash on every build** — and Screen Recording permission is bound to that hash, so every
-rebuild silently revokes it. Create a self-signed certificate once:
+`make-app.sh` signs ad-hoc unless it finds a certificate, which gives the bundle a **fresh
+code hash on every build** — and TCC permissions are bound to that hash, so every rebuild
+silently revokes *both* Screen Recording (capture stops) and Accessibility (pinch zoom
+stops). Create a self-signed certificate once:
 
 > Keychain Access → Certificate Assistant → Create a Certificate…
 > Name `HoloFrame Dev`, Identity Type **Self Signed Root**, Certificate Type **Code Signing**
 
-```bash
-export HOLOFRAME_SIGN_IDENTITY="HoloFrame Dev"
-```
+Nothing to export — the script finds it by name. Both grants then survive every rebuild.
 
-Then the grant survives rebuilds. If it ever gets stuck:
-`tccutil reset ScreenCapture id.prasetya.holoframe`.
+Two things about that certificate are counter-intuitive enough to be worth stating, because
+between them they cost a working setup several days of ad-hoc rebuilds:
+
+* **It will never appear in `security find-identity -v`.** A self-signed root is not
+  "valid" to the trust policy, so the `-v` listing reports *zero identities* and hides it
+  completely. The script searches without `-v` and signs by SHA-1 rather than by name.
+* **Trust is not required and does not need granting.** `codesign` only needs the private
+  key, and the signature it produces passes `--verify --deep --strict`. What matters is the
+  designated requirement, which becomes `identifier "id.prasetya.holoframe" and certificate
+  leaf = H"…"` — with no cdhash in it. That is what TCC records, and it no longer changes
+  when the binary does.
+
+If a grant ever gets stuck: `tccutil reset ScreenCapture id.prasetya.holoframe`, or
+`tccutil reset Accessibility id.prasetya.holoframe`.
 
 ## Using it
 
 | | |
 |---|---|
-| **⌘⌥R** | Recentre: makes where you are looking the middle of the canvas |
+| **⌘⌥R** | Recentre: makes where you are looking the middle of the canvas, and puts zoom back to 1:1 |
+| **Right-⌥ + pinch** | Zoom the canvas. Release the key and pinch belongs to your apps again |
 | **Menu bar** | Glasses icon — recentre, recalibrate, settings, quit, and live status |
 
 ### Plugging in and out
@@ -117,8 +129,49 @@ Edit and relaunch. Every key has a default, so a partial file is fine.
 | `smoothingBeta` | 0.007 | Higher gives less lag when turning |
 | `predictionSeconds` | 0.016 | 0 disables prediction |
 | `edgeFeather` | 0 | Pixels of fade at the canvas boundary. Off deliberately — softening that edge means blending across it, which dims the outermost pixels of real content |
+| `pinchZoomGain` | 1.6 | How much a right-⌥ pinch moves the zoom |
+| `zoomMax` | 4.0 | Ceiling on magnification |
+| `cursorEscapeSpeed` | 900 | View px/s toward the built-in screen before the pointer is handed over |
 | `idleTimeoutSeconds` | 90 | 0 keeps it running regardless |
 | `invertYaw` / `invertPitch` / `invertRoll` | false | Direction flips, verified against the hardware |
+
+### Zoom
+
+Hold **right-Option** and pinch on the trackpad. Zoom is sustained — it stays where you put
+it — and **⌘⌥R** resets it to 1:1 along with your heading, which is the way out if you lose
+track of how big things got.
+
+The modifier is the whole design. The canvas is a real desktop, so pinch is already spoken
+for by whatever app is sitting on it; taking it globally would mean you could no longer
+pinch in Preview exactly when Preview is what you are looking at. While right-Option is
+down the pinch is HoloFrame's and is swallowed before any app sees it. Release it and pinch
+goes back to the focused app, untouched. Right-Option specifically because nothing else
+claims it — held alone it is inert on macOS, and it is distinguishable from left-Option,
+which apps *do* use, through the device-dependent flag bits.
+
+Head panning stays world-fixed while zoomed: the field of view spans the *visible* canvas
+width, so magnifying makes the canvas behave like a larger object at the same distance,
+scanned at the same angular rate. Small head movements become fine adjustments, which is
+what you want when you have magnified something to read it. The trade is that crossing the
+whole canvas at 4× takes more neck than you have — zoom out, move, zoom back in, the same
+as any map. Once an axis fits entirely in view, panning on it is pinned, so fully zoomed
+out is a steady overview rather than a picture that wanders in surrounding black.
+
+Zooming out averages across the footprint each view pixel covers, up to 4×4. Without it,
+which canvas pixel gets sampled changes with a fraction of a pixel of pan, so text turns
+into noise that crawls as you move. That is the job a mip chain would normally do, but
+capture textures come straight from the IOSurface and cannot carry mips without a
+full-canvas copy every frame — so it is done in the shader, where it costs nothing at or
+above 1:1.
+
+For a *lasting* size change, prefer a smaller canvas resolution in System Settings. That
+re-lays-out the desktop and redraws text at native sharpness; magnifying can only stretch
+pixels that were already drawn.
+
+This is the one feature that needs **Accessibility** permission. Swallowing an event rather
+than merely watching it requires an active event tap, and there is no way to have the first
+without the second. Everything else works without it — the tap just never starts, and the
+menu bar offers the prompt.
 
 ### The magnetic anchor
 
@@ -171,8 +224,22 @@ from the arrangement.
 ### The pointer
 
 Held inside the visible viewport with a 16 px inset, and dragged along as the viewport
-moves, so it is always where you are looking. Push it through the viewport edge that
-*faces* your built-in screen and it hands over; coming back is automatic.
+moves, so it is always where you are looking.
+
+Getting out is a **speed** test, not a position test — flick the pointer hard through the
+viewport edge that *faces* your built-in screen and it hands over. Position alone cannot
+tell the difference between the two ways the pointer ends up outside the viewport: you
+pushed it there, or you turned your head and the viewport left without it. Glancing up
+puts the pointer below the viewport exactly as swiping down does, so a position test throws
+it onto the built-in screen every time you look around, and you have to look back down to
+fetch it. Head motion moves the viewport and not the pointer, so it registers zero pointer
+velocity and the test separates the two cleanly. Resting against the edge, or easing into
+it, now stays. *Pointer escape* in Settings sets how hard is hard enough.
+
+Coming back is a warp: crossing onto the canvas puts the pointer wherever the display
+arrangement says, essentially never inside the viewport — so it must be placed there
+deliberately. It re-enters through the edge it left by, at the same position along that
+edge.
 
 ## Measured cost
 
@@ -206,6 +273,7 @@ compositing a 7680×2160 desktop, not something HoloFrame adds.
 | `Sources/HoloFrame/DesktopCapture.swift` | ScreenCaptureKit → `MTLTexture`, zero-copy. |
 | `Sources/HoloFrame/GlassesDisplay.swift` | Metal renderer, the window on the glasses, on-glasses text. |
 | `Sources/HoloFrame/CursorManager.swift` | Keeps the pointer visible; hands it between displays. |
+| `Sources/HoloFrame/PinchZoom.swift` | Right-⌥ + pinch, via an event tap that only swallows while the key is held. |
 | `Tools/` | `make-app.sh`, `make-icon.sh`, and the probes used to reverse-engineer both subsystems. |
 | `Design/` | Icon sources. |
 
@@ -217,7 +285,8 @@ placement detail. Normal runs are quiet.
 Two features were built, measured against real use, and removed. Both are recorded because
 the reasons are not obvious and the ideas are tempting.
 
-**Lean to zoom** — lean in to magnify, sit back for the overview. Three designs failed. An
+**Lean to zoom** — lean in to magnify, sit back for the overview. Three designs failed, and
+zoom is now on right-⌥ + pinch instead. An
 accelerometer cannot tell you that you *are* leaning: once you have leaned in and settled
 it reads pure gravity again, identical to sitting upright, so absolute position is absent
 from the signal rather than merely noisy. Integrating twice needs a zero-velocity update to
@@ -234,9 +303,23 @@ was made to work reliably enough to log correct traces and still did not feel de
 use.
 
 The common thread: both inferred intent from a sensor that is also watching everything else
-you do, which means thresholds, which means false triggers and misses. The physical buttons
-on the temple report themselves over the MCU interface (`P_BUTTON_PRESSED`, `0x6C05`) and
-need no threshold at all. That is the direction worth pursuing.
+you do, which means thresholds, which means false triggers and misses. Nothing that has to
+guess whether you meant it has survived here. What replaced them — the temple buttons, which
+report themselves over the MCU interface (`P_BUTTON_PRESSED`, `0x6C05`), and a modifier key
+— share the property of being unambiguous by construction rather than by tuning.
+
+### A trap worth naming
+
+`CGEventType` and `NSEvent.EventType` share a numbering space, and they **collide**.
+`CGEventType.scrollWheel` is 22; `NSEvent.EventType.magnify` is 30. Subscribing an event
+tap to 22 believing it is magnify delivers scroll events instead — and then asking one of
+those for `.magnification` does not return a wrong value, it raises
+`NSInternalInconsistencyException` and takes the process with it. Ask the `NSEvent` what it
+*is* before asking what it contains.
+
+The tap also subscribes to every gesture type rather than only the two it acts on. That is
+not tidiness lost: a narrow mask was one of the differences between this and a probe that
+provably received magnify events, and removing variables mattered more than removing bits.
 
 ## Background
 

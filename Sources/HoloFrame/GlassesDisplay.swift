@@ -92,18 +92,36 @@ struct ViewConfig: Codable {
     /// rather than something drawn on top of it.
     var cursorHintOpacity: Double = 0.72
 
+    /// How fast the pointer must be moving toward the built-in screen, in canvas pixels per
+    /// second, for the viewport edge to let it through rather than hold it. A deliberate
+    /// flick clears this easily; nudging up against the edge, or turning your head so the
+    /// viewport leaves the pointer behind, does not. Lower it if getting out is a fight,
+    /// raise it if the pointer keeps escaping when you did not mean it to.
+    var cursorEscapeSpeed: Double = 900
+
     /// Stop drawing and capturing after the glasses have been motionless this long. Set 0
     /// to keep running regardless.
     var idleTimeoutSeconds: Double = 90
+
+    /// Ceiling on magnification. Past about 4x you are looking at very large blurry
+    /// pixels: the canvas is captured at its own resolution, so magnifying stretches what
+    /// was already drawn rather than re-rendering text bigger. For a lasting size change,
+    /// pick a smaller canvas resolution in System Settings instead — that re-lays-out the
+    /// desktop and redraws text sharp.
+    var zoomMax: Double = 4.0
+
+    /// How much of a trackpad pinch turns into zoom, while right-Option is held. 1.0 is
+    /// the raw system magnification — Apple's own value, calibrated for pinching a photo
+    /// across an unbounded range. This range is bounded and small by comparison (0.25x to
+    /// 4x is the whole of it), so the same gain crosses the entire span in one gesture,
+    /// which is what makes it feel uncontrollable. Well under 1 is right here.
+    var pinchZoomGain: Double = 0.5
 
     /// Anchor yaw to the local magnetic field, which is the only thing that can bound drift
     /// rather than merely slow it. Set false to fly on gyro and gravity alone — the anchor
     /// disables itself anyway if the field here turns out to be incoherent.
     var magneticAnchor = true
 
-    /// Residual acceleration in g that counts as a tap on the frame. Raise it if the
-    /// glasses trigger on their own, lower it if firm taps go unnoticed.
-    var tapThreshold: Double = 0.15
 
     // MARK: persistence
 
@@ -167,7 +185,8 @@ struct Uniforms {
     float  indicatorBack;   // opacity of the surrounding map
     float2 cursor;          // pointer position in canvas pixels
     float  cursorAlpha;     // 0..1 fade of the locator ring
-    float  cursorRadius;
+    float  cursorRadius;    // view pixels
+    float  zoom;            // >1 magnifies, <1 shows more canvas; 1 is dot-to-dot
 };
 
 vertex float4 vsMain(uint vid [[vertex_id]]) {
@@ -183,16 +202,45 @@ fragment float4 fsMain(float4 pos [[position]],
 
     float2 fromCentre = pos.xy - u.viewSize * 0.5;
     float c = cos(u.roll), s = sin(u.roll);
+
+    // View pixels to canvas pixels. At zoom 1 this is the identity and the sampling is
+    // dot-to-dot; above 1 one canvas pixel covers several view pixels, below 1 the
+    // reverse.
     float2 rotated = float2(fromCentre.x * c - fromCentre.y * s,
                             fromCentre.x * s + fromCentre.y * c);
-    float2 canvasPx = rotated + u.center;
+    float2 canvasPx = rotated / u.zoom + u.center;
 
     // Past the edge of the canvas, show black rather than smearing the edge pixels.
     float4 colour = float4(0.0, 0.0, 0.0, 1.0);
     bool onCanvas = canvasPx.x >= 0.0 && canvasPx.y >= 0.0 &&
                     canvasPx.x < u.canvasSize.x && canvasPx.y < u.canvasSize.y;
     if (onCanvas) {
-        colour = canvas.sample(smp, canvasPx / u.canvasSize);
+        // Zoomed out, one view pixel covers 1/zoom canvas pixels, and a single tap picks
+        // one of them arbitrarily — which turns text into noise that crawls as the view
+        // moves, because a fraction of a pixel of pan changes WHICH pixel gets picked.
+        // Averaging over the footprint is what the texture's absent mip chain would have
+        // done. Capture textures come straight from the IOSurface and cannot carry mips
+        // without a full-canvas copy every frame, so it is done here instead: at 4x4 the
+        // cost lands only when zoomed right out, and n is 1 at or above 1:1, so
+        // magnifying pays nothing at all.
+        int n = clamp(int(ceil(1.0 / u.zoom)), 1, 4);
+        if (n == 1) {
+            colour = canvas.sample(smp, canvasPx / u.canvasSize);
+        } else {
+            float inv = 1.0 / float(n);
+            float3 sum = float3(0.0);
+            for (int j = 0; j < n; ++j) {
+                for (int i = 0; i < n; ++i) {
+                    // Offsets span one view pixel, so after the divide they span exactly
+                    // the canvas footprint that view pixel covers.
+                    float2 o = (float2(float(i), float(j)) + 0.5) * inv - 0.5;
+                    float2 f = fromCentre + o;
+                    float2 r = float2(f.x * c - f.y * s, f.x * s + f.y * c);
+                    sum += canvas.sample(smp, (r / u.zoom + u.center) / u.canvasSize).rgb;
+                }
+            }
+            colour = float4(sum * inv * inv, 1.0);
+        }
         if (u.feather > 0.5) {
             // Distance to the nearest canvas edge, faded over `feather` pixels. This
             // necessarily dims real content, which is why it defaults to off.
@@ -205,7 +253,10 @@ fragment float4 fsMain(float4 pos [[position]],
     // Locator ring around the pointer. Measured in canvas space, so it needs no inverse
     // transform and stays correct however the view is rotated by roll compensation.
     if (u.cursorAlpha > 0.002 && onCanvas) {
-        float d = distance(canvasPx, u.cursor);
+        // Scaled into view pixels: a ring measured in canvas pixels would balloon as you
+        // magnify and shrink to nothing as you zoom out, when what it has to do is stay
+        // the same size in front of your eye.
+        float d = distance(canvasPx, u.cursor) * u.zoom;
         float band = 1.0 - smoothstep(u.cursorRadius - 4.0, u.cursorRadius, abs(d - u.cursorRadius));
         if (band > 0.001) {
             colour.rgb = mix(colour.rgb, float3(1.0, 0.95, 0.45), band * u.cursorAlpha);
@@ -223,8 +274,11 @@ fragment float4 fsMain(float4 pos [[position]],
 
         if (p.x >= 0.0 && p.y >= 0.0 && p.x <= mapW && p.y <= mapH) {
             float2 scale = float2(mapW, mapH) / u.canvasSize;
-            float2 viewMin = (u.center - u.viewSize * 0.5) * scale;
-            float2 viewMax = (u.center + u.viewSize * 0.5) * scale;
+            // Not named `half` — that is a Metal type, and the shader is compiled at
+            // runtime, so the failure would be an app that starts and shows black.
+            float2 reach = u.viewSize * 0.5 / u.zoom;
+            float2 viewMin = (u.center - reach) * scale;
+            float2 viewMax = (u.center + reach) * scale;
             bool inView = p.x >= viewMin.x && p.x <= viewMax.x &&
                           p.y >= viewMin.y && p.y <= viewMax.y;
 
@@ -324,6 +378,7 @@ private struct Uniforms {
     var cursor: SIMD2<Float>
     var cursorAlpha: Float
     var cursorRadius: Float
+    var zoom: Float
 }
 
 final class GlassesDisplay: NSObject {
@@ -429,6 +484,93 @@ final class GlassesDisplay: NSObject {
     func setPaused(_ value: Bool) {
         paused = value
         if !value { smoother.reset(); lastFrameTime = nil }
+    }
+
+    // MARK: - zoom
+
+    /// Canvas pixels per view pixel. 1 is dot-to-dot, the only value where text is drawn
+    /// at exactly the resolution it was rendered at. Above 1 magnifies; below 1 fits more
+    /// canvas into the view.
+    ///
+    /// Sustained rather than momentary: you set it and it stays, because how big you want
+    /// text is not a decision you make several times a minute. Recentring puts it back to
+    /// 1, which doubles as the way out if you ever lose track of where you are.
+    private var zoom: Double = 1.0
+    /// Where the pinch has asked the zoom to go. `zoom` chases this rather than jumping to
+    /// it, so a burst of gesture events becomes one continuous movement instead of a
+    /// staircase.
+    private var zoomTarget: Double = 1.0
+    private let zoomLock = NSLock()
+
+    /// How long the zoom takes to catch up with the pinch. Short enough not to feel like
+    /// lag, long enough to absorb the fact that gesture events arrive in clumps.
+    private let zoomSmoothingSeconds = 0.06
+
+    var currentZoom: Double {
+        zoomLock.lock()
+        defer { zoomLock.unlock() }
+        return zoom
+    }
+
+    /// Multiply the zoom by `factor`, clamped. Multiplicative because that is what makes
+    /// a pinch feel linear: the same finger movement should be worth the same proportion
+    /// of the current scale whether you are at 0.3x or 3x.
+    ///
+    /// The per-event clamp matters more than it looks. Magnification arrives as a stream
+    /// of small deltas that compound, so the scale grows EXPONENTIALLY with how far your
+    /// fingers travel: the first millimetres do almost nothing, and by the time the change
+    /// is large enough to notice it is already running away from you. That reads as sluggish
+    /// and jumpy at the same time, which sounds contradictory and is in fact one symptom.
+    /// Bounding each step keeps a single outsized event from lurching the view.
+    func scaleZoom(by factor: Double) {
+        let bounded = min(max(factor, 0.9), 1.1)
+        zoomLock.lock()
+        zoomTarget = min(max(zoomTarget * bounded, zoomFloor), config.zoomMax)
+        zoomLock.unlock()
+        flashPositionIndicator()
+    }
+
+    func resetZoom() {
+        zoomLock.lock()
+        let changed = abs(zoom - 1.0) > 0.0001
+        zoom = 1.0
+        zoomTarget = 1.0
+        zoomLock.unlock()
+        // The anchor goes with it: recentring means "put everything back", and an offset
+        // left behind would park the view somewhere your head is not pointing.
+        zoomAnchorOffset = .zero
+        lastRenderedZoom = 1.0
+        if changed { flashPositionIndicator() }
+    }
+
+    /// Advance the smoothed zoom one frame toward the target, in log space so a step feels
+    /// the same size at 0.3x as at 3x.
+    private func advanceZoom(dt: Double) -> Double {
+        zoomLock.lock()
+        defer { zoomLock.unlock() }
+        guard abs(zoom - zoomTarget) > 0.0001 else { return zoom }
+        let alpha = 1 - exp(-dt / zoomSmoothingSeconds)
+        let stepped = exp(log(zoom) + (log(zoomTarget) - log(zoom)) * alpha)
+        zoom = abs(log(zoomTarget / stepped)) < 0.0005 ? zoomTarget : stepped
+        return zoom
+    }
+
+    /// Keeps whatever is at the middle of the view at the middle of the view while the
+    /// zoom changes. Without it the pan term is scaled by zoom, so the view slides toward
+    /// the canvas centre as you magnify — you aim at something, zoom, and it drifts off.
+    private var zoomAnchorOffset = SIMD2<Double>(0, 0)
+    private var lastRenderedZoom: Double = 1.0
+
+    /// Zooming out past the point where the whole canvas already fits shows nothing but a
+    /// smaller picture surrounded by more black, so that is the floor. Recomputed from the
+    /// live canvas because the resolution can be changed underneath us.
+    private var zoomFloor: Double {
+        let canvas = capture.texture
+        let viewWidth = Double(metalLayer.drawableSize.width)
+        let viewHeight = Double(metalLayer.drawableSize.height)
+        guard let canvas, viewWidth > 1, viewHeight > 1 else { return 0.25 }
+        let fit = min(viewWidth / Double(canvas.width), viewHeight / Double(canvas.height))
+        return min(max(fit, 0.1), 1.0)
     }
 
     /// Show the position map for a moment — on recentre, so you can see where you landed.
@@ -740,9 +882,19 @@ final class GlassesDisplay: NSObject {
         lastFrameTime = now
         let euler = smoother(yaw: raw.yaw, pitch: raw.pitch, roll: raw.roll, dt: dt)
 
+        let zoom = advanceZoom(dt: dt)
+
         // Dot-to-dot: the glasses show `viewWidth` pixels across `horizontalFOV` degrees,
         // so one degree of head turn moves the canvas by this many pixels.
-        let pixelsPerDegree = viewWidth / config.horizontalFOV
+        //
+        // Divided by zoom because what the FOV spans is the VISIBLE canvas width, which
+        // zoom changes. Keeping it this way is what makes the canvas stay put in the
+        // world while magnified: it behaves like a larger object at the same distance,
+        // scanned at the same angular rate, so small head movements become fine
+        // adjustments exactly where you need them. The trade is that crossing the whole
+        // canvas at high magnification takes more neck than you have — the answer to
+        // which is to zoom out, move, and zoom back in, the same as every map.
+        let pixelsPerDegree = viewWidth / config.horizontalFOV / zoom
 
         // The canvas is fixed in the world, so the view moves WITH your head: turning left
         // (+yaw) shows the canvas's left side, which means moving the window left — a
@@ -751,17 +903,49 @@ final class GlassesDisplay: NSObject {
         let yawSign: Double = config.invertYaw ? 1 : -1
         let pitchSign: Double = config.invertPitch ? 1 : -1
 
-        var centerX = canvasWidth / 2 + yawSign * euler.yaw * pixelsPerDegree * config.panGain
-        var centerY = canvasHeight / 2 + pitchSign * euler.pitch * pixelsPerDegree * config.panGain
+        var panX = yawSign * euler.yaw * pixelsPerDegree * config.panGain
+        var panY = pitchSign * euler.pitch * pixelsPerDegree * config.panGain
+
+        // Zoom about the middle of the view rather than the middle of the canvas.
+        //
+        // The pan term is divided by zoom, so changing zoom changes it — which means that
+        // anywhere except dead centre, magnifying drags the canvas sideways underneath
+        // you. You aim at something, pinch, and it slides out of view. Absorbing the
+        // difference into an offset holds the canvas point at the centre of the view
+        // exactly still, and head movement afterwards pans correctly at the new scale.
+        if abs(zoom - lastRenderedZoom) > 1e-9 {
+            let base = viewWidth / config.horizontalFOV
+            let previousX = yawSign * euler.yaw * (base / lastRenderedZoom) * config.panGain
+            let previousY = pitchSign * euler.pitch * (base / lastRenderedZoom) * config.panGain
+            zoomAnchorOffset.x += previousX - panX
+            zoomAnchorOffset.y += previousY - panY
+            lastRenderedZoom = zoom
+        }
+        panX += zoomAnchorOffset.x
+        panY += zoomAnchorOffset.y
+
+        var centerX = canvasWidth / 2 + panX
+        var centerY = canvasHeight / 2 + panY
 
         // Let the view travel all the way to the canvas edge rather than stopping when
         // the edge reaches the edge of vision. That way any corner can be brought to the
         // centre of the glasses, where the optics are sharpest and text is easiest to
         // read. Past the canvas the shader draws black.
-        let marginX = viewWidth * config.edgeOverscan
-        let marginY = viewHeight * config.edgeOverscan
-        centerX = min(max(centerX, -marginX), canvasWidth + marginX)
-        centerY = min(max(centerY, -marginY), canvasHeight + marginY)
+        //
+        // Once an axis of the canvas fits entirely within the view there is nowhere left
+        // to pan on it, and letting it drift would only slide the picture around in the
+        // surrounding black. Pin it instead, so fully zoomed out is a steady overview
+        // rather than something that wanders off when you move your head.
+        let visibleWidth = viewWidth / zoom
+        let visibleHeight = viewHeight / zoom
+        let marginX = visibleWidth * config.edgeOverscan
+        let marginY = visibleHeight * config.edgeOverscan
+        centerX = visibleWidth >= canvasWidth
+            ? canvasWidth / 2
+            : min(max(centerX, -marginX), canvasWidth + marginX)
+        centerY = visibleHeight >= canvasHeight
+            ? canvasHeight / 2
+            : min(max(centerY, -marginY), canvasHeight + marginY)
 
         // Snap to whole pixels only while nearly still, so text sits on exact texels when
         // you are reading. Snapping during motion is what makes panning look like it is
@@ -796,13 +980,14 @@ final class GlassesDisplay: NSObject {
                 ? Float(min(max((cursorUntil - now) / config.cursorHintSeconds, 0), 1)
                         * config.cursorHintOpacity)
                 : 0,
-            cursorRadius: Float(config.cursorHintRadius)
+            cursorRadius: Float(config.cursorHintRadius),
+            zoom: Float(zoom)
         )
 
         visibleRectLock.lock()
-        visibleRect = CGRect(x: sampleX - viewWidth / 2,
-                             y: sampleY - viewHeight / 2,
-                             width: viewWidth, height: viewHeight)
+        visibleRect = CGRect(x: sampleX - visibleWidth / 2,
+                             y: sampleY - visibleHeight / 2,
+                             width: visibleWidth, height: visibleHeight)
         visibleRectLock.unlock()
 
         let pass = MTLRenderPassDescriptor()

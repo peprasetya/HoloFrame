@@ -49,6 +49,7 @@ final class AppController {
     private var statusItem: StatusItem?
     private var waitingWindow: NSWindow?
     private var recenterHotKey: HotKey?
+    private var pinchZoom: PinchZoom?
     private var needsCalibration: Bool
 
     private var idlePaused = false
@@ -91,8 +92,32 @@ final class AppController {
     /// Put the view back where you are looking.
     private func recentreNow(_ how: String) {
         tracker.recenter()
+        // Zoom goes back to 1:1 with it. Recentring is the one thing you reach for when
+        // you have lost your bearings, so it has to restore ALL of what you changed —
+        // otherwise "I am somewhere odd and everything is the wrong size" only half fixes.
+        view?.resetZoom()
         view?.flashPositionIndicator()
         print("  recentred (\(how))")
+    }
+
+    // MARK: - pinch zoom
+
+    /// Hold right-Option and pinch. Started without prompting: if Accessibility is not
+    /// granted this quietly does nothing and the menu offers the prompt, because asking
+    /// for a permission at launch, for a feature the person may never use, is how apps
+    /// teach people to click Deny.
+    private func startPinchZoom() {
+        pinchZoom?.stop()
+        let zoom = PinchZoom { [weak self] amount in
+            guard let self, let view = self.view else { return }
+            view.scaleZoom(by: 1 + amount * self.settings.pinchZoomGain)
+        }
+        let running = zoom.start()
+        pinchZoom = zoom
+        statusItem?.setPinchZoomAvailable(running)
+        print(running
+              ? "  pinch zoom: hold right-⌥ and pinch"
+              : "  pinch zoom: needs Accessibility — enable it from the menu bar")
     }
 
     func start() {
@@ -100,6 +125,11 @@ final class AppController {
             recenter: { [weak self] in self?.recentreNow("menu") },
             recalibrate: { [weak self] in self?.runCalibration() },
             settings: { [weak self] in self?.showSettings() },
+            grantAccessibility: {
+                // Just open the prompt. Noticing that it was granted is the job of the
+                // periodic check, which watches regardless of how the grant happened.
+                PinchZoom.requestPermission()
+            },
             quit: { [weak self] in
                 self?.deactivate(reason: nil)
                 exit(0)
@@ -109,6 +139,8 @@ final class AppController {
                                 modifiers: HotKey.command | HotKey.option) { [weak self] in
             self?.recentreNow("⌘⌥R")
         }
+
+        startPinchZoom()
 
         // React to the glasses being plugged in or pulled out.
         CGDisplayRegisterReconfigurationCallback({ display, flags, context in
@@ -289,7 +321,7 @@ final class AppController {
         }
 
         cursor = CursorManager(canvasID: canvasID, builtInID: Self.findBuiltInDisplay(),
-                               glassesID: glassesID, display: view!)
+                               glassesID: glassesID, display: view!, settings: settings)
         cursor?.start()
 
         activeGlassesID = glassesID
@@ -384,6 +416,7 @@ final class AppController {
                 guard let self else { return }
                 self.settings = updated
                 self.view?.apply(updated)     // live, while you are wearing them
+                self.cursor?.apply(updated)
             }
         }
         settingsWindow?.show()
@@ -442,10 +475,26 @@ final class AppController {
 
         reportMagneticAnchor()
 
+        // Accessibility can appear at any moment, and just as easily from System Settings
+        // as from our own prompt — macOS sends no notification either way. Watching for it
+        // here, rather than only after someone uses the menu item, is what stops the
+        // outcome depending on WHICH route they took to grant it: the previous version
+        // only ever noticed a grant that followed its own prompt, so permitting HoloFrame
+        // directly in System Settings looked exactly like the feature being broken. One
+        // function call a second, and the whole failure mode goes away.
+        if pinchZoom?.isRunning != true, PinchZoom.isPermitted {
+            startPinchZoom()
+        }
+
         let size = canvas?.currentPixelSize ?? .zero
+        // Zoom is shown only when it is not 1:1 — that is precisely when you might be
+        // wondering why things look the way they do, and ⌘⌥R is the answer.
+        let zoom = view.currentZoom
+        let zoomText = abs(zoom - 1.0) > 0.01 ? String(format: " · %.2f× zoom", zoom) : ""
         statusItem?.update(text: idlePaused
             ? "Paused · \(Int(size.width)) × \(Int(size.height))"
-            : String(format: "%d × %d · %.0f fps", Int(size.width), Int(size.height), fps))
+            : String(format: "%d × %d · %.0f fps%@",
+                     Int(size.width), Int(size.height), fps, zoomText))
     }
 
     private var anchorWasLocked = false

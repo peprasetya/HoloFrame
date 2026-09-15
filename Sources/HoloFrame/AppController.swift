@@ -139,6 +139,9 @@ final class AppController {
                 guard let self, let view = self.view else { return }
                 view.scaleZoom(by: 1 + amount * self.settings.pinchZoomGain)
             },
+            onClutch: { [weak self] held in
+                self?.view?.setClutched(held)
+            },
             onPan: { [weak self] dx, dy in
                 self?.view?.pan(byScrollX: dx, y: dy)
             })
@@ -147,7 +150,7 @@ final class AppController {
         self.gestures = gestures
         statusItem?.setGesturesAvailable(running)
         print(running
-              ? "  trackpad: hold right-⌥ and pinch to zoom, scroll to pan"
+              ? "  right-⌥: hold to carry the canvas, scroll to pan, pinch to zoom"
               : "  trackpad zoom and pan: needs Accessibility — enable it from the menu bar")
     }
 

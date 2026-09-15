@@ -86,8 +86,9 @@ If a grant ever gets stuck: `tccutil reset ScreenCapture id.prasetya.holoframe`,
 | | |
 |---|---|
 | **⌘⌥R** | Recentre: makes where you are looking the middle of the canvas, and drops zoom and pan |
-| **Right-⌥ + pinch** | Zoom the canvas. Release the key and pinch belongs to your apps again |
-| **Right-⌥ + two-finger scroll** | Nudge the canvas, like dragging a map — the fine adjustment recentring is not |
+| **Hold right-⌥** | Carry the canvas: the view stays put while you turn your head, so the canvas comes with you |
+| **Right-⌥ + two-finger scroll** | Nudge the canvas without moving your head, like dragging a map |
+| **Right-⌥ + pinch** | Zoom the canvas. Release the key and pinch and scroll belong to your apps again |
 | **Menu bar** | Glasses icon — recentre, recalibrate, settings, quit, and live status |
 
 ### Plugging in and out
@@ -146,12 +147,18 @@ Hold **right-Option** and pinch on the trackpad. Zoom is sustained — it stays 
 it — and **⌘⌥R** resets it to 1:1 along with your heading, which is the way out if you lose
 track of how big things got.
 
-Hold **right-Option** and scroll with two fingers to move the canvas by hand. Recentring is
-coarse — it moves everything to wherever you happen to be looking — so this is for "a little
-to the left": the canvas moves exactly as far as you drag, in the direction documents
-scroll, and head tracking carries on from wherever you leave it. The glide after your
-fingers lift is ignored, so it stops when you do; the pan cannot bank distance past the
-canvas edge; and ⌘⌥R drops it along with zoom. Five-finger gestures were considered first
+**Hold right-Option to carry the canvas.** While the key is down the view stays exactly as
+it is, so turning your head brings the canvas with you; let go and head tracking resumes
+from wherever you left it. It is a clutch, the way you lift a mouse to reposition it, and it
+covers what recentring is too coarse for — recentring moves everything to wherever you
+happen to be looking, when all you meant was "that window, a little more to the left". It
+cannot carry the view past the canvas edge, and ⌘⌥R drops it along with zoom. Pinching while
+the key is held zooms as usual.
+
+**Or scroll with two fingers** while holding it, for when you would rather not move your
+head: the canvas moves exactly as far as you drag, in the direction documents scroll. The
+glide after your fingers lift is ignored, so it stops when you do, and scrolling while
+carrying the canvas moves what you are carrying. Five-finger gestures were considered first
 and rejected — macOS reserves four- and five-finger swipes and pinches for Mission Control,
 Launchpad and Show Desktop.
 
@@ -369,7 +376,7 @@ times a second nearly every frame differs, so there it does little.
 | `Sources/HoloFrame/DesktopCapture.swift` | ScreenCaptureKit → `MTLTexture`, zero-copy. |
 | `Sources/HoloFrame/GlassesDisplay.swift` | Metal renderer, the window on the glasses, on-glasses text. |
 | `Sources/HoloFrame/CursorManager.swift` | Keeps the pointer visible; hands it between displays. |
-| `Sources/HoloFrame/TrackpadGestures.swift` | Right-⌥ + pinch and scroll, via event taps on their own thread that are only in the input path while the key is held. |
+| `Sources/HoloFrame/TrackpadGestures.swift` | Right-⌥: hold to carry the canvas, scroll to pan, pinch to zoom — via event taps on their own thread, only in the input path while the key is held. |
 | `Sources/HoloFrame/Diagnostics.swift` | Environment switches for measuring without wearing the glasses. |
 | `Tools/` | `make-app.sh`, `make-icon.sh`, and the probes used to reverse-engineer both subsystems. |
 | `Tools/bench/` | Measuring without wearing: event-tap latency, IMU recorder, the yaw-drift simulator, the load benchmark. |

@@ -1,28 +1,29 @@
 //
-//  TrackpadGestures.swift — hold right-Option: pinch to zoom, two-finger scroll to pan.
+//  TrackpadGestures.swift — right-Option: hold to carry the canvas, scroll to pan, pinch to
+//  zoom.
 //
-//  The canvas is a whole desktop, so every gesture worth using is already spoken for by
-//  whatever app is sitting on it. Pinch and scroll most of all: taking them globally would
-//  mean you can no longer pinch in Preview or scroll a web page exactly when that is the
-//  thing you are looking at. The modifier is what resolves that — while right-Option is held
-//  the gesture is HoloFrame's and is swallowed before any app sees it; the moment it is
-//  released the gesture belongs to the focused app again, unchanged.
+//  Holding right-Option is a CLUTCH. While it is down the view stays exactly as it is, so
+//  turning your head carries the canvas with it; let go and head tracking resumes from
+//  wherever you brought it. That is the natural way to move something you are looking at —
+//  the way you would lift a mouse to reposition it — and it replaces both a scroll gesture
+//  and most uses of recentring, which moves everything to wherever you happen to be looking
+//  and so is more than you wanted when all you meant was "a little to the left".
+//
+//  While the key is held, a two-finger scroll also moves the canvas — for when you would
+//  rather not turn your head — and a trackpad pinch zooms. The canvas is a whole desktop, so
+//  both gestures are already spoken for by whatever app is sitting on it; taking them
+//  globally would mean you could no longer scroll a page or pinch in Preview exactly when
+//  that is the thing you are looking at. The modifier resolves that — while right-Option is
+//  down the gesture is HoloFrame's and is swallowed before any app sees it; release it and
+//  the gesture belongs to the focused app again.
 //
 //  Right-Option specifically because nothing else claims it. Held on its own it is inert
 //  on macOS — it only does anything in combination with a key — and it is distinguishable
 //  from left-Option, which apps do use, through the device-dependent flag bits.
 //
-//  Pan exists because head tracking and recentring are both coarse. Recentring moves
-//  everything to wherever you happen to be looking, which is more than you wanted when all
-//  you meant was "a little to the left"; two fingers nudge the canvas exactly as far as you
-//  drag it, like moving a map. (Five-finger gestures were considered and rejected: macOS
-//  reserves four- and five-finger swipes and pinches for Mission Control, Launchpad and Show
-//  Desktop, and does not deliver them to an event tap reliably.)
-//
-//  This is the one part of HoloFrame that needs Accessibility permission. Swallowing an
-//  event, rather than merely watching it, requires an active event tap, and there is no
-//  way to have the first without the second. Everything else keeps working without it; the
-//  taps simply never start, and the menu bar says so.
+//  Watching the key needs nothing special. Swallowing the pinch needs Accessibility
+//  permission, because only an active event tap can do that. Without the permission the
+//  taps never start, and the menu bar offers the prompt.
 //
 //  An active tap is the most dangerous thing this app does, and the first version proved
 //  it. The window server delivers input as ONE ordered stream, and an active tap holds that
@@ -40,7 +41,7 @@
 //    * The gesture tap is switched OFF except while right-Option is actually held. A
 //      separate listen-only tap watches the modifier; listen-only taps are told about events
 //      after the fact and never hold the stream. So in normal use HoloFrame is not in the
-//      input path at all — only for the moments you are deliberately zooming or panning.
+//      input path at all.
 //
 
 import AppKit
@@ -53,6 +54,9 @@ final class TrackpadGestures {
     /// Called on the main thread with the pinch magnitude: positive to magnify, negative to
     /// shrink, in the system's own units where roughly ±1 is a full pinch across the trackpad.
     private let onPinch: (Double) -> Void
+
+    /// Called on the main thread when right-Option goes down (true) or up (false).
+    private let onClutch: (Bool) -> Void
 
     /// Called on the main thread with a scroll delta in points, already in the direction the
     /// system's natural-scrolling setting says content should move.
@@ -93,15 +97,18 @@ final class TrackpadGestures {
 
     /// Whether there is a canvas for gestures to act on. While false, right-⌥ gestures are
     /// left alone rather than swallowed — without glasses plugged in, eating a pinch or a
-    /// scroll and doing nothing with it would just look like the trackpad broke. Set from
-    /// the main thread, read on the tap thread.
+    /// scroll and doing nothing with it would just look like the trackpad broke. Set from the main
+    /// thread, read on the tap thread.
     var isActive: Bool {
         get { activeState.withLock { $0 } }
         set { activeState.withLock { $0 = newValue } }
     }
 
-    init(onPinch: @escaping (Double) -> Void, onPan: @escaping (Double, Double) -> Void) {
+    init(onPinch: @escaping (Double) -> Void,
+         onClutch: @escaping (Bool) -> Void,
+         onPan: @escaping (Double, Double) -> Void) {
         self.onPinch = onPinch
+        self.onClutch = onClutch
         self.onPan = onPan
     }
 
@@ -218,6 +225,7 @@ final class TrackpadGestures {
         guard down != armed else { return }
         armed = down
         if let gestureTap { CGEvent.tapEnable(tap: gestureTap, enable: down && isActive) }
+        DispatchQueue.main.async { [onClutch] in onClutch(down) }
     }
 
     private func gesture(type: CGEventType, event: CGEvent) -> Unmanaged<CGEvent>? {

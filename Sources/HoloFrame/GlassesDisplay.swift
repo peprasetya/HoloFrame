@@ -593,32 +593,47 @@ final class GlassesDisplay: NSObject {
         return min(max(fit, 0.1), 1.0)
     }
 
-    // MARK: - manual pan
+    // MARK: - carrying the canvas (right-⌥ clutch)
 
-    /// Where right-⌥ scrolling has moved the view, in canvas pixels, on top of whatever head
-    /// tracking says. Kept separate so recentring can drop it and head motion still pans
-    /// normally from wherever you left it.
+    /// How far the canvas has been carried, in canvas pixels, on top of whatever head
+    /// tracking says. Kept separate so recentring can drop it, and so head motion still pans
+    /// normally from wherever the canvas was left.
     private var panOffset = SIMD2<Double>(0, 0)
-    /// The centre head tracking alone gave last frame, and the range the centre may occupy.
-    /// Pans are bounded against these so the offset cannot wind up past the canvas edge —
-    /// otherwise scrolling beyond the edge would bank distance that has to be scrolled back
-    /// before anything moves again.
-    private var lastTrackedCenter = SIMD2<Double>(0, 0)
-    private var centerMin = SIMD2<Double>(0, 0)
-    private var centerMax = SIMD2<Double>(0, 0)
+    /// The centre shown last frame, which is what a clutch holds on to.
+    private var lastCenter: SIMD2<Double>?
+    /// While right-⌥ is held: the centre to keep showing, whatever the head does.
+    private var clutchCenter: SIMD2<Double>?
 
-    /// Move the view by a scroll delta, in points. Content follows the fingers, the same
-    /// way the system's scrolling direction setting makes every document behave.
+    /// Hold (true) or release (false) the canvas.
+    ///
+    /// While held, every frame works out where head tracking alone would put the view and
+    /// folds the difference into `panOffset`, so the picture stays exactly where it is and
+    /// the canvas turns with you. On release nothing is recomputed: the offset simply stays,
+    /// and head tracking carries on from the canvas's new position — no jump either way.
+    func setClutched(_ held: Bool) {
+        clutchCenter = held ? lastCenter : nil
+        flashPositionIndicator()
+    }
+
+    /// Move the view by a right-⌥ scroll delta, in points. Content follows the fingers, the
+    /// same way the system's scrolling direction setting makes every document behave. Not
+    /// bounded here: the next frame re-bounds the offset to the canvas edge.
     func pan(byScrollX dx: Double, y dy: Double) {
-        let scale = config.scrollPanGain / max(currentZoom, 0.01)
-        let wanted = lastTrackedCenter + panOffset - SIMD2(dx, dy) * scale
-        let bounded = pointwiseMin(pointwiseMax(wanted, centerMin), centerMax)
-        panOffset = bounded - lastTrackedCenter
+        let step = SIMD2(dx, dy) * (config.scrollPanGain / max(currentZoom, 0.01))
+        if clutchCenter != nil {
+            // Holding the canvas and scrolling at once: move what is being held.
+            clutchCenter! -= step
+        } else {
+            panOffset -= step
+        }
         flashPositionIndicator()
     }
 
     func resetPan() {
         panOffset = .zero
+        // Recentring while the key happens to be held (⌘⌥R with the right-hand ⌥) must win:
+        // holding on to the old centre would undo it on the very next frame.
+        clutchCenter = nil
     }
 
     /// Show the position map for a moment — on recentre, so you can see where you landed.
@@ -971,8 +986,8 @@ final class GlassesDisplay: NSObject {
         panX += zoomAnchorOffset.x
         panY += zoomAnchorOffset.y
 
-        // Where head tracking alone puts the centre. Manual panning is added on top.
-        lastTrackedCenter = SIMD2(canvasWidth / 2 + panX, canvasHeight / 2 + panY)
+        // Where head tracking alone puts the centre. Carrying the canvas is added on top.
+        let trackedCenter = SIMD2(canvasWidth / 2 + panX, canvasHeight / 2 + panY)
 
         // Let the view travel all the way to the canvas edge rather than stopping when
         // the edge reaches the edge of vision. That way any corner can be brought to the
@@ -988,11 +1003,19 @@ final class GlassesDisplay: NSObject {
         let marginX = visibleWidth * config.edgeOverscan
         let marginY = visibleHeight * config.edgeOverscan
         let pinnedX = visibleWidth >= canvasWidth, pinnedY = visibleHeight >= canvasHeight
-        centerMin = SIMD2(pinnedX ? canvasWidth / 2 : -marginX,
-                          pinnedY ? canvasHeight / 2 : -marginY)
-        centerMax = SIMD2(pinnedX ? canvasWidth / 2 : canvasWidth + marginX,
-                          pinnedY ? canvasHeight / 2 : canvasHeight + marginY)
-        let center = pointwiseMin(pointwiseMax(lastTrackedCenter + panOffset, centerMin), centerMax)
+        let centerMin = SIMD2(pinnedX ? canvasWidth / 2 : -marginX,
+                              pinnedY ? canvasHeight / 2 : -marginY)
+        let centerMax = SIMD2(pinnedX ? canvasWidth / 2 : canvasWidth + marginX,
+                              pinnedY ? canvasHeight / 2 : canvasHeight + marginY)
+        // Clutched: hold the picture still by absorbing head motion into the offset.
+        if let held = clutchCenter {
+            panOffset = pointwiseMin(pointwiseMax(held, centerMin), centerMax) - trackedCenter
+        }
+        let center = pointwiseMin(pointwiseMax(trackedCenter + panOffset, centerMin), centerMax)
+        // Re-bound the offset to what was actually shown, so it can never bank distance past
+        // the canvas edge that would have to be turned back through before anything moves.
+        panOffset = center - trackedCenter
+        lastCenter = center
         let centerX = center.x, centerY = center.y
 
         // Snap to whole pixels only while nearly still, so text sits on exact texels when

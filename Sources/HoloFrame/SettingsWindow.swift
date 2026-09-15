@@ -230,11 +230,12 @@ final class SettingsWindow: NSObject, NSWindowDelegate {
                 How far the canvas moves when you hold right-Option and scroll with two \
                 fingers.
 
-                This is the fine adjustment that recentring is not. Recentre moves the whole \
-                canvas to wherever you happen to be looking; a scroll nudges it exactly as \
-                far as you drag, like moving a map, and head tracking carries on normally \
-                from wherever you leave it. The canvas follows your fingers in the same \
-                direction documents do, so the system's scroll-direction setting applies.
+                Holding right-Option on its own already lets the canvas follow your head — \
+                the view stays put while you turn, and the canvas comes with you. Scrolling \
+                is the same thing without the neck: it nudges the canvas exactly as far as \
+                you drag, like moving a map, and works while you are holding it too. The \
+                canvas follows your fingers in the same direction documents do, so the \
+                system's scroll-direction setting applies.
 
                 1.0 moves the canvas exactly with your fingers. The canvas is four views \
                 wide, so something above that saves a lot of swiping. Turn it DOWN if \
@@ -247,6 +248,7 @@ final class SettingsWindow: NSObject, NSWindowDelegate {
                 """,
                 range: 0.5...6, value: { $0.scrollPanGain },
                 apply: { $0.scrollPanGain = $1 }, format: "%.1f×"),
+
 
             Row(label: "Capture rate", detail: "Most times a second the desktop is re-captured; head movement stays smooth regardless",
                 help: """

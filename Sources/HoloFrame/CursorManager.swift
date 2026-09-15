@@ -191,8 +191,65 @@ final class CursorManager {
         pushTravel = 0
     }
 
+    /// Global bounds of every display the pointer could genuinely cross onto from the canvas:
+    /// everything active except the canvas itself and the glasses, whose display shows only
+    /// HoloFrame's own view and so is a wall, not a neighbour.
+    private func neighbourBounds() -> [CGRect] {
+        var count: UInt32 = 0
+        var ids = [CGDirectDisplayID](repeating: 0, count: 16)
+        guard CGGetActiveDisplayList(16, &ids, &count) == .success else { return [] }
+        return ids.prefix(Int(count))
+            .filter { $0 != canvasID && $0 != glassesID }
+            .map { CGDisplayBounds($0) }
+    }
+
+    /// Whether another display continues past this canvas edge at this point along it.
+    /// Per point rather than per edge, because a neighbour usually covers only part of an
+    /// edge — a laptop screen below a canvas three times its width, say.
+    private func neighbour(_ edge: Edge, canvas: CGRect, at global: CGPoint,
+                           among displays: [CGRect]) -> Bool {
+        displays.contains { d in
+            switch edge {
+            case .left:   return abs(d.maxX - canvas.minX) < 1 && global.y >= d.minY && global.y < d.maxY
+            case .right:  return abs(d.minX - canvas.maxX) < 1 && global.y >= d.minY && global.y < d.maxY
+            case .top:    return abs(d.maxY - canvas.minY) < 1 && global.x >= d.minX && global.x < d.maxX
+            case .bottom: return abs(d.minY - canvas.maxY) < 1 && global.x >= d.minX && global.x < d.maxX
+            }
+        }
+    }
+
+    /// Where the pointer may go this tick, in canvas-local pixels.
+    ///
+    /// Normally the viewport, inset so the arrow stays drawn. But where the viewport has
+    /// reached a canvas edge that nothing lies beyond, the pointer is allowed all the way to
+    /// the edge. That edge is a real screen edge, and macOS keeps things there: a hidden Dock
+    /// only appears when the pointer touches the edge it lives on, and hot corners only fire
+    /// in the corner itself. Holding the pointer 16 pixels short made both unreachable, on
+    /// whichever side they were. Edges with a display beyond keep the inset, so crossing
+    /// onto another screen is still the deliberate flick it was.
+    private func reach(inset: CGRect, viewport: CGRect, canvas: CGRect,
+                       local: CGPoint) -> (minX: CGFloat, maxX: CGFloat, minY: CGFloat, maxY: CGFloat) {
+        var r = (minX: inset.minX, maxX: inset.maxX, minY: inset.minY, maxY: inset.maxY)
+        let size = canvas.size
+        let displays = neighbourBounds()
+        let global = CGPoint(x: local.x + canvas.minX, y: local.y + canvas.minY)
+        if viewport.minX <= 0.5, !neighbour(.left, canvas: canvas, at: global, among: displays) {
+            r.minX = 0
+        }
+        if viewport.maxX >= size.width - 0.5, !neighbour(.right, canvas: canvas, at: global, among: displays) {
+            r.maxX = size.width - 1
+        }
+        if viewport.minY <= 0.5, !neighbour(.top, canvas: canvas, at: global, among: displays) {
+            r.minY = 0
+        }
+        if viewport.maxY >= size.height - 0.5, !neighbour(.bottom, canvas: canvas, at: global, among: displays) {
+            r.maxY = size.height - 1
+        }
+        return r
+    }
+
     private func tick() {
-        guard let location = CGEvent(source: nil)?.location else { return }
+        guard var location = CGEvent(source: nil)?.location else { return }
 
         let now = CACurrentMediaTime()
         // Clamped: Timer can fire late, and a long gap would otherwise divide a large,
@@ -204,15 +261,25 @@ final class CursorManager {
 
         // The glasses display is a real macOS display, so the pointer can wander onto it —
         // where it is invisible, because HoloFrame draws its own view there rather than
-        // that display's desktop. Put it back in the middle of what you are looking at.
+        // that display's desktop.
         if let glassesID, CGDisplayBounds(glassesID).contains(location) {
-            let viewport = display.currentVisibleRect
-            if viewport.width > 1 {
-                warp(to: CGPoint(x: canvasBounds.origin.x + viewport.midX,
-                                 y: canvasBounds.origin.y + viewport.midY))
+            if onCanvas {
+                // Pushed off a canvas edge that the pointer is now allowed to reach: treat
+                // the glasses as a wall and put it back on the edge it went through, rather
+                // than yanking it somewhere else.
+                location = CGPoint(x: min(max(location.x, canvasBounds.minX), canvasBounds.maxX - 1),
+                                   y: min(max(location.y, canvasBounds.minY), canvasBounds.maxY - 1))
+                warp(to: location)
+            } else {
+                // Arrived there some other way: put it in the middle of what you are looking at.
+                let viewport = display.currentVisibleRect
+                if viewport.width > 1 {
+                    warp(to: CGPoint(x: canvasBounds.origin.x + viewport.midX,
+                                     y: canvasBounds.origin.y + viewport.midY))
+                }
+                forgetPointer()
+                return
             }
-            forgetPointer()
-            return
         }
 
         guard canvasBounds.contains(location) else {   // built-in: leave alone
@@ -286,9 +353,10 @@ final class CursorManager {
             }
         }
 
-        // --- otherwise hold it inside the viewport ---
-        let clamped = CGPoint(x: min(max(local.x, inset.minX), inset.maxX),
-                              y: min(max(local.y, inset.minY), inset.maxY))
+        // --- otherwise hold it inside the viewport, or up to a free canvas edge ---
+        let limits = reach(inset: inset, viewport: viewport, canvas: canvasBounds, local: local)
+        let clamped = CGPoint(x: min(max(local.x, limits.minX), limits.maxX),
+                              y: min(max(local.y, limits.minY), limits.maxY))
         if abs(clamped.x - local.x) > 0.5 || abs(clamped.y - local.y) > 0.5 {
             warp(to: CGPoint(x: clamped.x + canvasBounds.origin.x,
                              y: clamped.y + canvasBounds.origin.y))
@@ -327,7 +395,12 @@ final class CursorManager {
         onCanvas = true
     }
 
+    /// How many times the pointer has been moved programmatically. Each one moves the
+    /// drawn cursor, which dirties the canvas and costs a captured frame.
+    private(set) var warpCount = 0
+
     private func warp(to point: CGPoint) {
+        warpCount += 1
         CGWarpMouseCursorPosition(point)
         // Without this the pointer stays decoupled from the mouse after a warp and drifts.
         CGAssociateMouseAndMouseCursorPosition(1)

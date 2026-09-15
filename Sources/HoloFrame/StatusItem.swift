@@ -13,7 +13,7 @@ final class StatusItem {
 
     private let item: NSStatusItem
     private let statusLine = NSMenuItem(title: "", action: nil, keyEquivalent: "")
-    private let accessibilityItem = NSMenuItem(title: "Enable Pinch Zoom…",
+    private let accessibilityItem = NSMenuItem(title: "Enable Trackpad Zoom & Pan…",
                                                action: nil, keyEquivalent: "")
 
     /// Actions are supplied by main, which owns the tracker and the display.
@@ -71,7 +71,7 @@ final class StatusItem {
     }
 
     /// Offer the Accessibility prompt only while it would achieve something.
-    func setPinchZoomAvailable(_ available: Bool) {
+    func setGesturesAvailable(_ available: Bool) {
         accessibilityItem.isHidden = available
     }
 

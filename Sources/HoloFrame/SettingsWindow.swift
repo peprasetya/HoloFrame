@@ -225,6 +225,50 @@ final class SettingsWindow: NSObject, NSWindowDelegate {
                 range: 0.15...1.5, value: { $0.pinchZoomGain },
                 apply: { $0.pinchZoomGain = $1 }, format: "%.2f×"),
 
+            Row(label: "Scroll pan", detail: "How far a right-⌥ two-finger scroll moves the canvas; ⌘⌥R undoes it",
+                help: """
+                How far the canvas moves when you hold right-Option and scroll with two \
+                fingers.
+
+                This is the fine adjustment that recentring is not. Recentre moves the whole \
+                canvas to wherever you happen to be looking; a scroll nudges it exactly as \
+                far as you drag, like moving a map, and head tracking carries on normally \
+                from wherever you leave it. The canvas follows your fingers in the same \
+                direction documents do, so the system's scroll-direction setting applies.
+
+                1.0 moves the canvas exactly with your fingers. The canvas is four views \
+                wide, so something above that saves a lot of swiping. Turn it DOWN if \
+                placing things precisely is fiddly, UP if crossing the canvas takes too many \
+                swipes. The glide after your fingers lift is ignored on purpose, so the \
+                canvas stops the moment you do.
+
+                Recentre (⌘⌥R, or the glasses button) drops the pan along with zoom and \
+                heading. Needs the same Accessibility permission as pinch zoom.
+                """,
+                range: 0.5...6, value: { $0.scrollPanGain },
+                apply: { $0.scrollPanGain = $1 }, format: "%.1f×"),
+
+            Row(label: "Capture rate", detail: "Most times a second the desktop is re-captured; head movement stays smooth regardless",
+                help: """
+                The most times per second HoloFrame picks up changes on the desktop.
+
+                This is NOT how smoothly the view follows your head — that is always \
+                redrawn at the glasses' full rate from the latest capture. It is how smoothly \
+                things moving on the desktop itself reach you: scrolling, video, a cursor \
+                blinking, text appearing as you type. Nothing is captured while the desktop \
+                is not changing, whatever this is set to.
+
+                Lowering it saves a little heat, not a lot. Measured on a 2019 16" MacBook \
+                Pro with a busy desktop: 30 fps took about 5 points off the window server's \
+                CPU and 7 off the integrated GPU, compared with 60. Most of the window \
+                server's work is drawing a 7680×2160 desktop at all, which this cannot touch.
+
+                Leave it at 60 for video. Try 30 if the fans bother you while you mostly read \
+                and type.
+                """,
+                range: 15...60, value: { $0.captureFrameRate },
+                apply: { $0.captureFrameRate = ($1 / 5).rounded() * 5 }, format: "%.0f fps"),
+
             Row(label: "Idle timeout", detail: "Pause drawing after this long motionless; 0 never pauses",
                 help: """
                 Stop drawing and capturing once the glasses have not moved for this long.

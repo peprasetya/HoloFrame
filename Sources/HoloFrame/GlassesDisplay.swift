@@ -117,6 +117,16 @@ struct ViewConfig: Codable {
     /// which is what makes it feel uncontrollable. Well under 1 is right here.
     var pinchZoomGain: Double = 0.5
 
+    /// How far a right-⌥ two-finger scroll moves the canvas, in view pixels per point of
+    /// scroll. 1 moves the canvas exactly with your fingers, like dragging a map; the canvas
+    /// is four view-widths across, so a little more than that saves swiping.
+    var scrollPanGain: Double = 2.0
+
+    /// Most times a second the canvas is captured. Head movement does not depend on this —
+    /// the view is redrawn at the glasses' full rate from the latest capture — only how
+    /// smoothly things moving ON the desktop reach the glasses: scrolling, video, typing.
+    var captureFrameRate: Double = 60
+
     /// Anchor yaw to the local magnetic field, which is the only thing that can bound drift
     /// rather than merely slow it. Set false to fly on gyro and gravity alone — the anchor
     /// disables itself anyway if the field here turns out to be incoherent.
@@ -396,6 +406,16 @@ final class GlassesDisplay: NSObject {
     private var displayLink: CADisplayLink?
     private var capturedDisplay: CGDirectDisplayID?
     private(set) var framesDrawn = 0
+    /// Main-thread time spent inside render(), excluding the wait for a drawable.
+    private(set) var renderSeconds = 0.0
+    /// Display-link ticks that produced nothing new and so were not drawn.
+    private(set) var framesSkipped = 0
+    /// What the last presented frame was made from. A frame with the same texture and the
+    /// same uniforms would come out pixel-identical, so it is skipped. Cleared whenever the
+    /// layer may no longer be showing that frame.
+    private var lastDrawnTexture: ObjectIdentifier?
+    private var lastDrawnUniforms: [UInt8] = []
+    private static let restingRollStep = 0.02 * Double.pi / 180
 
     private var smoother: PoseSmoother
     private var lastFrameTime: CFTimeInterval?
@@ -483,7 +503,7 @@ final class GlassesDisplay: NSObject {
     /// Stop drawing without tearing anything down, so resuming is instant.
     func setPaused(_ value: Bool) {
         paused = value
-        if !value { smoother.reset(); lastFrameTime = nil }
+        if !value { smoother.reset(); lastFrameTime = nil; lastDrawnUniforms = [] }
     }
 
     // MARK: - zoom
@@ -571,6 +591,34 @@ final class GlassesDisplay: NSObject {
         guard let canvas, viewWidth > 1, viewHeight > 1 else { return 0.25 }
         let fit = min(viewWidth / Double(canvas.width), viewHeight / Double(canvas.height))
         return min(max(fit, 0.1), 1.0)
+    }
+
+    // MARK: - manual pan
+
+    /// Where right-⌥ scrolling has moved the view, in canvas pixels, on top of whatever head
+    /// tracking says. Kept separate so recentring can drop it and head motion still pans
+    /// normally from wherever you left it.
+    private var panOffset = SIMD2<Double>(0, 0)
+    /// The centre head tracking alone gave last frame, and the range the centre may occupy.
+    /// Pans are bounded against these so the offset cannot wind up past the canvas edge —
+    /// otherwise scrolling beyond the edge would bank distance that has to be scrolled back
+    /// before anything moves again.
+    private var lastTrackedCenter = SIMD2<Double>(0, 0)
+    private var centerMin = SIMD2<Double>(0, 0)
+    private var centerMax = SIMD2<Double>(0, 0)
+
+    /// Move the view by a scroll delta, in points. Content follows the fingers, the same
+    /// way the system's scrolling direction setting makes every document behave.
+    func pan(byScrollX dx: Double, y dy: Double) {
+        let scale = config.scrollPanGain / max(currentZoom, 0.01)
+        let wanted = lastTrackedCenter + panOffset - SIMD2(dx, dy) * scale
+        let bounded = pointwiseMin(pointwiseMax(wanted, centerMin), centerMax)
+        panOffset = bounded - lastTrackedCenter
+        flashPositionIndicator()
+    }
+
+    func resetPan() {
+        panOffset = .zero
     }
 
     /// Show the position map for a moment — on recentre, so you can see where you landed.
@@ -772,6 +820,7 @@ final class GlassesDisplay: NSObject {
             }
         }
 
+        lastDrawnUniforms = []      // a fresh layer is showing nothing yet
         let link = view.displayLink(target: self, selector: #selector(render))
         link.add(to: .main, forMode: .common)
         self.displayLink = link
@@ -858,10 +907,7 @@ final class GlassesDisplay: NSObject {
     // MARK: drawing
 
     @objc private func render() {
-        guard !paused,
-              let canvas = capture.texture,
-              let drawable = metalLayer.nextDrawable(),
-              let commandBuffer = queue.makeCommandBuffer() else { return }
+        guard !paused, let canvas = capture.texture else { return }
 
         let viewWidth = Double(metalLayer.drawableSize.width)
         let viewHeight = Double(metalLayer.drawableSize.height)
@@ -872,12 +918,13 @@ final class GlassesDisplay: NSObject {
         // motion-to-photon latency down.
         // Extrapolated forward, so what reaches your eye matches where your head will be
         // by the time it gets there rather than where it was when we read the sensor.
-        let raw = config.predictionSeconds > 0
-            ? tracker.predictedEulerDegrees(ahead: config.predictionSeconds,
-                                            maxDegrees: config.predictionMaxDegrees)
-            : tracker.eulerDegrees
-
         let now = CACurrentMediaTime()
+        let raw = Diagnostics.simulateMotion
+            ? Diagnostics.simulatedPose(at: now)
+            : config.predictionSeconds > 0
+                ? tracker.predictedEulerDegrees(ahead: config.predictionSeconds,
+                                                maxDegrees: config.predictionMaxDegrees)
+                : tracker.eulerDegrees
         let dt = lastFrameTime.map { min(max(now - $0, 1.0 / 240.0), 0.1) } ?? 1.0 / 60.0
         lastFrameTime = now
         let euler = smoother(yaw: raw.yaw, pitch: raw.pitch, roll: raw.roll, dt: dt)
@@ -924,8 +971,8 @@ final class GlassesDisplay: NSObject {
         panX += zoomAnchorOffset.x
         panY += zoomAnchorOffset.y
 
-        var centerX = canvasWidth / 2 + panX
-        var centerY = canvasHeight / 2 + panY
+        // Where head tracking alone puts the centre. Manual panning is added on top.
+        lastTrackedCenter = SIMD2(canvasWidth / 2 + panX, canvasHeight / 2 + panY)
 
         // Let the view travel all the way to the canvas edge rather than stopping when
         // the edge reaches the edge of vision. That way any corner can be brought to the
@@ -940,12 +987,13 @@ final class GlassesDisplay: NSObject {
         let visibleHeight = viewHeight / zoom
         let marginX = visibleWidth * config.edgeOverscan
         let marginY = visibleHeight * config.edgeOverscan
-        centerX = visibleWidth >= canvasWidth
-            ? canvasWidth / 2
-            : min(max(centerX, -marginX), canvasWidth + marginX)
-        centerY = visibleHeight >= canvasHeight
-            ? canvasHeight / 2
-            : min(max(centerY, -marginY), canvasHeight + marginY)
+        let pinnedX = visibleWidth >= canvasWidth, pinnedY = visibleHeight >= canvasHeight
+        centerMin = SIMD2(pinnedX ? canvasWidth / 2 : -marginX,
+                          pinnedY ? canvasHeight / 2 : -marginY)
+        centerMax = SIMD2(pinnedX ? canvasWidth / 2 : canvasWidth + marginX,
+                          pinnedY ? canvasHeight / 2 : canvasHeight + marginY)
+        let center = pointwiseMin(pointwiseMax(lastTrackedCenter + panOffset, centerMin), centerMax)
+        let centerX = center.x, centerY = center.y
 
         // Snap to whole pixels only while nearly still, so text sits on exact texels when
         // you are reading. Snapping during motion is what makes panning look like it is
@@ -966,11 +1014,16 @@ final class GlassesDisplay: NSObject {
             : 0
 
         let rollSign: Double = config.invertRoll ? -1 : 1
+        var roll = config.compensateRoll ? rollSign * euler.roll * .pi / 180.0 : 0
+        // At rest, roll gets the same treatment as the centre: held to a fine step so that
+        // sub-pixel sway does not make every frame different from the last. 0.02° moves
+        // the corners of the view by a third of a pixel.
+        if atRest { roll = (roll / Self.restingRollStep).rounded() * Self.restingRollStep }
         var uniforms = Uniforms(
             canvasSize: SIMD2(Float(canvasWidth), Float(canvasHeight)),
             viewSize: SIMD2(Float(viewWidth), Float(viewHeight)),
             center: SIMD2(Float(sampleX), Float(sampleY)),
-            roll: config.compensateRoll ? Float(rollSign * euler.roll * .pi / 180.0) : 0,
+            roll: Float(roll),
             feather: Float(config.edgeFeather),
             indicator: indicator,
             indicatorView: Float(config.indicatorViewportOpacity),
@@ -990,6 +1043,27 @@ final class GlassesDisplay: NSObject {
                              width: visibleWidth, height: visibleHeight)
         visibleRectLock.unlock()
 
+        // Nothing changed, nothing to draw.
+        //
+        // Reading is mostly holding still, and while still the view is snapped to whole
+        // pixels — so frame after frame comes out byte-identical. Drawing them anyway is not
+        // free even though the draw itself is: the finished frame has to be presented to a
+        // display that, on a dual-GPU Mac, hangs off the OTHER GPU, and that hand-over was
+        // measured at over a third of the discrete GPU's time. The layer keeps showing the
+        // last frame, so skipping one is invisible.
+        let texture = ObjectIdentifier(canvas)
+        let unchanged = texture == lastDrawnTexture
+            && withUnsafeBytes(of: &uniforms) { $0.elementsEqual(lastDrawnUniforms) }
+        if unchanged, !Diagnostics.disableFrameSkip {
+            framesSkipped += 1
+            return
+        }
+        guard let drawable = metalLayer.nextDrawable(),
+              let commandBuffer = queue.makeCommandBuffer() else { return }
+        // Timed from here: nextDrawable() can block waiting for the display, and that wait
+        // is not work this thread is doing.
+        let encodeStart = CACurrentMediaTime()
+
         let pass = MTLRenderPassDescriptor()
         pass.colorAttachments[0].texture = drawable.texture
         pass.colorAttachments[0].loadAction = .clear
@@ -1005,6 +1079,9 @@ final class GlassesDisplay: NSObject {
 
         commandBuffer.present(drawable)
         commandBuffer.commit()
+        lastDrawnTexture = texture
+        lastDrawnUniforms = withUnsafeBytes(of: &uniforms) { Array($0) }
         framesDrawn += 1
+        renderSeconds += CACurrentMediaTime() - encodeStart
     }
 }

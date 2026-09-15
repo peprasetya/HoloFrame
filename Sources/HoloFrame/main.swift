@@ -22,19 +22,6 @@ setvbuf(stdout, nil, _IOLBF, 0)
 print("HoloFrame")
 print("=========")
 
-// Mirroring makes a perfectly good display look broken in a dozen misleading ways: it
-// reports the resolution of whatever it mirrors, stays out of the active list, and ignores
-// mode changes. Catch it here or every later symptom points somewhere wrong.
-if HFVirtualDisplay.anyDisplayIsMirroring() {
-    print("! Displays are mirroring; HoloFrame needs an extended desktop.")
-    if HFVirtualDisplay.disableAllMirroring() {
-        print("  released all displays from mirroring.")
-        RunLoop.current.run(until: Date().addingTimeInterval(3.0))
-    } else {
-        print("  FAILED — turn mirroring off in System Settings > Displays and retry.")
-    }
-}
-
 let settings = ViewConfig.loadOrCreate()
 let controller = AppController(canvasWidth: 7680,
                                canvasHeight: 2160,

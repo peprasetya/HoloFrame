@@ -58,8 +58,8 @@ open -a HoloFrame.app --stdout /tmp/holoframe.log --stderr /tmp/holoframe.log
 
 `make-app.sh` signs ad-hoc unless it finds a certificate, which gives the bundle a **fresh
 code hash on every build** — and TCC permissions are bound to that hash, so every rebuild
-silently revokes *both* Screen Recording (capture stops) and Accessibility (pinch zoom
-stops). Create a self-signed certificate once:
+silently revokes *both* Screen Recording (capture stops) and Accessibility (trackpad zoom
+and pan stop). Create a self-signed certificate once:
 
 > Keychain Access → Certificate Assistant → Create a Certificate…
 > Name `HoloFrame Dev`, Identity Type **Self Signed Root**, Certificate Type **Code Signing**
@@ -85,8 +85,9 @@ If a grant ever gets stuck: `tccutil reset ScreenCapture id.prasetya.holoframe`,
 
 | | |
 |---|---|
-| **⌘⌥R** | Recentre: makes where you are looking the middle of the canvas, and puts zoom back to 1:1 |
+| **⌘⌥R** | Recentre: makes where you are looking the middle of the canvas, and drops zoom and pan |
 | **Right-⌥ + pinch** | Zoom the canvas. Release the key and pinch belongs to your apps again |
+| **Right-⌥ + two-finger scroll** | Nudge the canvas, like dragging a map — the fine adjustment recentring is not |
 | **Menu bar** | Glasses icon — recentre, recalibrate, settings, quit, and live status |
 
 ### Plugging in and out
@@ -99,6 +100,9 @@ HoloFrame follows the glasses. Everything it creates is tied to them being prese
 - **Unplugged while running** — the canvas is destroyed, capture and rendering stop, and
   the desktop returns to normal. A panel offers to quit.
 - **Plugged back in** — it rebuilds automatically. Calibration is remembered.
+- **Mirroring** — the canvas needs an extended desktop, so display mirroring is switched off
+  when the glasses connect. Only then: launching HoloFrame with no glasses attached leaves a
+  mirrored projector or office display alone.
 
 ### Comfort and motion
 
@@ -129,17 +133,27 @@ Edit and relaunch. Every key has a default, so a partial file is fine.
 | `smoothingBeta` | 0.007 | Higher gives less lag when turning |
 | `predictionSeconds` | 0.016 | 0 disables prediction |
 | `edgeFeather` | 0 | Pixels of fade at the canvas boundary. Off deliberately — softening that edge means blending across it, which dims the outermost pixels of real content |
-| `pinchZoomGain` | 1.6 | How much a right-⌥ pinch moves the zoom |
+| `pinchZoomGain` | 0.5 | How much a right-⌥ pinch moves the zoom |
+| `scrollPanGain` | 2.0 | View pixels a right-⌥ scroll moves the canvas, per point of scroll |
 | `zoomMax` | 4.0 | Ceiling on magnification |
 | `cursorEscapeSpeed` | 900 | View px/s toward the built-in screen before the pointer is handed over |
 | `idleTimeoutSeconds` | 90 | 0 keeps it running regardless |
 | `invertYaw` / `invertPitch` / `invertRoll` | false | Direction flips, verified against the hardware |
 
-### Zoom
+### Zoom and pan
 
 Hold **right-Option** and pinch on the trackpad. Zoom is sustained — it stays where you put
 it — and **⌘⌥R** resets it to 1:1 along with your heading, which is the way out if you lose
 track of how big things got.
+
+Hold **right-Option** and scroll with two fingers to move the canvas by hand. Recentring is
+coarse — it moves everything to wherever you happen to be looking — so this is for "a little
+to the left": the canvas moves exactly as far as you drag, in the direction documents
+scroll, and head tracking carries on from wherever you leave it. The glide after your
+fingers lift is ignored, so it stops when you do; the pan cannot bank distance past the
+canvas edge; and ⌘⌥R drops it along with zoom. Five-finger gestures were considered first
+and rejected — macOS reserves four- and five-finger swipes and pinches for Mission Control,
+Launchpad and Show Desktop.
 
 The modifier is the whole design. The canvas is a real desktop, so pinch is already spoken
 for by whatever app is sitting on it; taking it globally would mean you could no longer
@@ -175,6 +189,16 @@ menu bar offers the prompt.
 
 ### The magnetic anchor
 
+**Currently dormant.** The magnetometer in these glasses carries an offset of its own — the
+field of the magnets inside them, turning with your head — and fitting a sphere to real
+readings taken through many orientations put it at about **0.25 G against a true field of
+about 0.16 G**. Two separate recordings agreed. An offset larger than the field bends the
+apparent heading by tens of degrees depending on where you face, and worn, the anchor
+logged 23–32° of "error" on a head that had not drifted, then pulled the view toward it:
+the canvas turning steadily one way. It stays off until that offset is measured and
+subtracted, which needs a short guided calibration that does not exist yet. What follows
+describes how it works once calibrated.
+
 It is not a compass and never asks where north is. Ten seconds after startup it records
 where the field points **in the world frame** and treats that as the anchor; afterwards,
 any rotation of the measured field away from it, in the horizontal plane, is yaw the gyro
@@ -195,6 +219,11 @@ reject transients that correct themselves. Three things defend against it instea
 - **Correction is slow enough to average out** what remains: 0.05 deg/s while you are
   still (under three pixels a second), rising to 2 deg/s while your head is moving, where
   it is hidden by the motion. Ordinary use erases accumulated error invisibly.
+- **It corrects the gyro bias too, not only the heading.** A heading nudge capped at a
+  crawl cannot keep up with a bias that is a few tenths of a deg/s off; the view slides and
+  the anchor trails behind. A persistent heading error *is* a measurement of that bias
+  error, so a slow, slew-limited share of it is folded back into the bias — the integral
+  half of a PI controller.
 - If the field proves **incoherent** during the learning pass, no anchor is set and the
   tracker behaves exactly as it did without one. Set `magneticAnchor` to false to force
   that.
@@ -209,6 +238,34 @@ of the canvas, so doing it automatically would fight you the moment you wanted t
 gaze off-centre — on the top-left corner, say, to read code there. It zeroes yaw *and*
 pitch (the glasses sit at an angle on your nose, so "comfortably straight ahead" is not
 level), but never roll — the desktop should stay level with the real horizon.
+
+### Yaw drift, and how it was measured
+
+Drift cannot be judged by wearing the glasses for a minute, so it was measured offline.
+The glasses were left on a desk while every raw IMU sample was recorded — real bias, real
+bias wander, real noise, the real magnetic field — and a scripted head motion with a
+**known** orientation was superimposed on the recording: the rates it implies added to the
+gyro, gravity and the field rotated into the moving head frame. The unmodified `HeadTracker`
+is fed the result and its yaw compared against the truth, over as many minutes as wanted.
+The scenarios are a head holding still with natural sway, glances between windows, reading
+line by line, and a deliberately asymmetric slow-out/fast-back.
+
+What that found, six minutes per run, worst yaw error with the anchor working — on a
+magnetometer assumed calibrated, which the real one is not yet (see the anchor section; with
+the anchor dormant, the gyro-only figures for a remembered bias were under 1° for holding
+still and glancing, and about 2° for reading):
+
+| | holding still | glancing between windows | reading |
+|---|---|---|---|
+| Before | 64° | 24° | 18° |
+| Bias learned only from desk-still windows, corrected by the anchor | 4° | 4° | 2° |
+| …remembered from the last session, deadband 0.4 → 0.15 | **0.2°** | **0.2°** | **0.2°** |
+
+The single largest cause was the bias estimator: a head holding still passes a test on
+*average* rate, but a two-second slice of its sway does not average to zero, and each
+accepted window taught the estimate some real head motion. Sway shows in the *spread* of
+the samples, which on a desk sits at 0.14 deg/s and on a head never does. The recorder,
+the simulator and how to run them are in `Tools/bench/README.md`.
 
 ### Setting the resolution
 
@@ -241,6 +298,15 @@ arrangement says, essentially never inside the viewport — so it must be placed
 deliberately. It re-enters through the edge it left by, at the same position along that
 edge.
 
+**Screen edges stay reachable.** When you look all the way to a canvas edge that has no
+display beyond it, the inset is dropped on that side and the pointer can touch the very last
+pixel — which is what a hidden Dock needs to appear, on whichever side it lives, and what
+hot corners need to fire. This is decided per point along the edge, not per edge, because a
+neighbour usually covers only part of one: with a laptop screen under the middle of the
+canvas, the bottom edge above the laptop keeps its inset (so crossing is still a flick),
+while the stretches either side of it reach the edge. The glasses' own display counts as a
+wall rather than a neighbour; pushing into it puts the pointer back on the canvas edge.
+
 ## Measured cost
 
 2019 16" MacBook Pro (i9-9880H, Radeon Pro 5500M), 7680×2160 canvas, desktop static:
@@ -261,6 +327,36 @@ zero-copy throughout: IOSurface-backed `CVPixelBuffer` → `CVMetalTextureCache`
 `MTLTexture`, pixels never touching the CPU. WindowServer's share is the inherent price of
 compositing a 7680×2160 desktop, not something HoloFrame adds.
 
+A **busy** desktop is a different picture, and it is the one that heats the machine. With
+three browsers, a video player, chat apps and a streaming terminal window all on the
+canvas, the desktop changed about 41 times a second. Averaged over three interleaved rounds
+of simulated head motion (`Tools/bench`):
+
+| | WindowServer | kernel_task | HoloFrame | Intel GPU | AMD GPU |
+|---|---|---|---|---|---|
+| Capturing at 60 fps | 99% | 15% | 16% | 47% | 45% |
+| Capture capped at 30 fps | 94% | 13% | 14% | 40% | 47% |
+| Capture capped at 20 fps | 95% | 12% | 13% | 36% | 44% |
+| Not capturing at all | 70% | 8% | 6% | 21% | 0% |
+
+So about 70% of a core is macOS drawing that desktop whether or not anyone looks at it, and
+capturing and presenting it to the glasses adds the rest. Capping the rate helps only a
+little, which is why it is a setting (*Capture rate*) and not the default.
+
+What did **not** matter, measured and ruled out: dragging the pointer along with the view,
+and leaving the pointer out of captured frames. What mattered a great deal: **which GPU
+renders**. On this dual-GPU Mac the virtual canvas is composited on the integrated GPU while
+the glasses hang off the discrete one. Rendering on the glasses' GPU means pulling each
+66 MB captured frame across the bus, and it measured 5–7 ms per frame and an effective
+30 fps. Rendering on the canvas's GPU measured 0.12 ms per frame at 60. HoloFrame picks the
+canvas's GPU and says so in the log.
+
+HoloFrame's own 16% is mostly handling a thousand IMU reports a second and the Metal and
+capture machinery: sampled, its own code — the tracker and the report decoder — barely
+registers. Frames whose texture and view are identical to the last are not drawn again,
+which helps while the desktop is static and you are holding still; on a desktop changing 40
+times a second nearly every frame differs, so there it does little.
+
 ## Layout
 
 | | |
@@ -273,12 +369,25 @@ compositing a 7680×2160 desktop, not something HoloFrame adds.
 | `Sources/HoloFrame/DesktopCapture.swift` | ScreenCaptureKit → `MTLTexture`, zero-copy. |
 | `Sources/HoloFrame/GlassesDisplay.swift` | Metal renderer, the window on the glasses, on-glasses text. |
 | `Sources/HoloFrame/CursorManager.swift` | Keeps the pointer visible; hands it between displays. |
-| `Sources/HoloFrame/PinchZoom.swift` | Right-⌥ + pinch, via an event tap that only swallows while the key is held. |
+| `Sources/HoloFrame/TrackpadGestures.swift` | Right-⌥ + pinch and scroll, via event taps on their own thread that are only in the input path while the key is held. |
+| `Sources/HoloFrame/Diagnostics.swift` | Environment switches for measuring without wearing the glasses. |
 | `Tools/` | `make-app.sh`, `make-icon.sh`, and the probes used to reverse-engineer both subsystems. |
+| `Tools/bench/` | Measuring without wearing: event-tap latency, IMU recorder, the yaw-drift simulator, the load benchmark. |
 | `Design/` | Icon sources. |
 
-Environment variable: `HOLOFRAME_VERBOSE=1` adds per-5s frame/pose logging and window
-placement detail. Normal runs are quiet.
+Environment variable: `HOLOFRAME_VERBOSE=1` adds window placement detail. Normal runs are
+quiet.
+
+For measuring rather than wearing, `Diagnostics.swift` documents a set of switches, all off
+unless set: `HOLOFRAME_SIM=1` drives the view from a synthetic head sweep and never
+idle-pauses, `HOLOFRAME_STATS=<s>` logs render and capture rates, render time, pointer warps
+and the tracker's bias and anchor state, and `HOLOFRAME_RECORD=<path>` writes every raw IMU
+sample to a file for replaying through the tracker offline. Pass them through `open`:
+
+```bash
+open -a HoloFrame.app --env HOLOFRAME_SIM=1 --env HOLOFRAME_STATS=5 \
+     --stdout /tmp/holoframe.log --stderr /tmp/holoframe.log
+```
 
 ## Tried and rejected
 
@@ -317,9 +426,23 @@ those for `.magnification` does not return a wrong value, it raises
 `NSInternalInconsistencyException` and takes the process with it. Ask the `NSEvent` what it
 *is* before asking what it contains.
 
-The tap also subscribes to every gesture type rather than only the two it acts on. That is
+The tap also subscribes to every gesture type rather than only the ones it acts on. That is
 not tidiness lost: a narrow mask was one of the differences between this and a probe that
 provably received magnify events, and removing variables mattered more than removing bits.
+
+### A second trap: an active event tap is in everyone's input path
+
+The window server delivers input as **one ordered stream**, and an active (`.defaultTap`)
+tap holds that stream until its callback returns — not just for the events it subscribed
+to, but for everything queued behind them. The trackpad emits gesture events continuously
+while a finger rests on it, so a gesture tap is in the path of nearly all input. The first
+version ran its tap on the main thread beside the renderer, and whenever the main thread
+fell behind under load, the whole machine's input waited: key-ups arrived late enough that
+macOS treated keys as held and opened the accent picker, keystrokes went missing, and the
+pointer stalled. The window server's own statistics show it — `CGGetEventTapList` reports
+each tap's latency. Now the taps live on a dedicated thread, and the active one is switched
+off except while right-⌥ is physically down; a listen-only tap, which never holds the
+stream, watches for the key.
 
 ## Background
 
@@ -369,11 +492,13 @@ Traps worth knowing before touching this code, all of which cost real time here:
 
 ## Known gaps
 
-- Yaw is anchored to the local magnetic field, which is what bounds the drift. Gyro-bias
-  estimation and the deadband only ever made the walk slower — nothing without an outside
-  reference can stop it. The one visible cost of the deadband is that rotation slower than
-  ~1 deg/s is damped, so a *very* slow deliberate pan lags slightly; above 3 deg/s it is
-  untouched.
+- **Yaw has no outside reference at the moment**, so it can still walk slowly — from bias
+  that changes while the glasses are worn and warming, which cannot be re-measured on a head.
+  ⌘⌥R or the temple button puts it back. The magnetic anchor would bound it, but only once
+  the magnetometer's internal offset (≈0.25 G, larger than Earth's field) is calibrated out;
+  a guided "turn the glasses through every direction" calibration is the next step.
+- The drift deadband (0.15 deg/s) damps rotation slower than about half a degree per
+  second a little; above 1 deg/s it is under 2%.
 - No stereo. The glasses stay in 2D mode. Stereo/SBS and VR video are a separate project;
   the sketch is a per-surface stereo layout rather than a single desktop plane.
 - `panGain` (1.0, physically exact) and `horizontalFOV` (40°, the Air's spec) in

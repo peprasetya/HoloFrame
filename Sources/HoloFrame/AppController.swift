@@ -49,7 +49,7 @@ final class AppController {
     private var statusItem: StatusItem?
     private var waitingWindow: NSWindow?
     private var recenterHotKey: HotKey?
-    private var pinchZoom: PinchZoom?
+    private var gestures: TrackpadGestures?
     private var needsCalibration: Bool
 
     private var idlePaused = false
@@ -66,6 +66,31 @@ final class AppController {
         self.tracker.magneticAnchorEnabled = settings.magneticAnchor
         self.needsCalibration = forceCalibration || stored == nil
         print("  axis mapping: \(stored?.summary ?? "not set — will calibrate on the glasses")")
+        if settings.magneticAnchor {
+            // Dormant until the magnetometer's internal offset has been measured: uncorrected,
+            // it is larger than Earth's field and turns the anchor into a source of drift
+            // rather than a cure for it. See HeadTracker.hardIronOffset.
+            print("  magnetic anchor: off until the magnetometer is calibrated")
+        }
+        if let stored, let bias = StoredGyroBias.load(for: stored) {
+            tracker.preset(bias: bias)
+            lastSavedBias = bias
+            print(String(format: "  gyro bias: %+.3f %+.3f %+.3f deg/s, from last time", bias.x, bias.y, bias.z))
+        }
+    }
+
+    private var lastSavedBias: SIMD3<Double>?
+    private var lastBiasSave = Date.distantPast
+
+    /// Remember a desk-quality bias for next launch. At most once a minute: on a desk a new
+    /// estimate arrives every couple of seconds, and none of them is worth a write.
+    private func saveBiasIfUpdated() {
+        guard Date().timeIntervalSince(lastBiasSave) > 60,
+              let bias = tracker.deskBias, bias != lastSavedBias,
+              let axes = AxisMap.load() else { return }
+        StoredGyroBias.save(bias, for: axes)
+        lastSavedBias = bias
+        lastBiasSave = Date()
     }
 
     // MARK: - detection
@@ -96,28 +121,34 @@ final class AppController {
         // you have lost your bearings, so it has to restore ALL of what you changed —
         // otherwise "I am somewhere odd and everything is the wrong size" only half fixes.
         view?.resetZoom()
+        view?.resetPan()
         view?.flashPositionIndicator()
         print("  recentred (\(how))")
     }
 
-    // MARK: - pinch zoom
+    // MARK: - trackpad zoom and pan
 
-    /// Hold right-Option and pinch. Started without prompting: if Accessibility is not
-    /// granted this quietly does nothing and the menu offers the prompt, because asking
+    /// Hold right-Option and pinch or scroll. Started without prompting: if Accessibility is
+    /// not granted this quietly does nothing and the menu offers the prompt, because asking
     /// for a permission at launch, for a feature the person may never use, is how apps
     /// teach people to click Deny.
-    private func startPinchZoom() {
-        pinchZoom?.stop()
-        let zoom = PinchZoom { [weak self] amount in
-            guard let self, let view = self.view else { return }
-            view.scaleZoom(by: 1 + amount * self.settings.pinchZoomGain)
-        }
-        let running = zoom.start()
-        pinchZoom = zoom
-        statusItem?.setPinchZoomAvailable(running)
+    private func startGestures() {
+        gestures?.stop()
+        let gestures = TrackpadGestures(
+            onPinch: { [weak self] amount in
+                guard let self, let view = self.view else { return }
+                view.scaleZoom(by: 1 + amount * self.settings.pinchZoomGain)
+            },
+            onPan: { [weak self] dx, dy in
+                self?.view?.pan(byScrollX: dx, y: dy)
+            })
+        let running = gestures.start()
+        gestures.isActive = state == .active
+        self.gestures = gestures
+        statusItem?.setGesturesAvailable(running)
         print(running
-              ? "  pinch zoom: hold right-⌥ and pinch"
-              : "  pinch zoom: needs Accessibility — enable it from the menu bar")
+              ? "  trackpad: hold right-⌥ and pinch to zoom, scroll to pan"
+              : "  trackpad zoom and pan: needs Accessibility — enable it from the menu bar")
     }
 
     func start() {
@@ -128,7 +159,7 @@ final class AppController {
             grantAccessibility: {
                 // Just open the prompt. Noticing that it was granted is the job of the
                 // periodic check, which watches regardless of how the grant happened.
-                PinchZoom.requestPermission()
+                TrackpadGestures.requestPermission()
             },
             quit: { [weak self] in
                 self?.deactivate(reason: nil)
@@ -140,7 +171,7 @@ final class AppController {
             self?.recentreNow("⌘⌥R")
         }
 
-        startPinchZoom()
+        startGestures()
 
         // React to the glasses being plugged in or pulled out.
         CGDisplayRegisterReconfigurationCallback({ display, flags, context in
@@ -186,6 +217,33 @@ final class AppController {
         print("\nGlasses detected — starting up.")
         hideWaitingWindow()
         state = .activating
+
+        // Mirroring makes a perfectly good display look broken in a dozen misleading ways:
+        // it reports the resolution of whatever it mirrors, stays out of the active list,
+        // and ignores mode changes. So it has to go before the canvas is made.
+        //
+        // Only here, once the glasses are actually plugged in — never at launch. Launching
+        // used to do it unconditionally, which quietly un-mirrored an office projector or
+        // a presentation display just because HoloFrame happened to start while it was
+        // connected and the glasses were not.
+        if HFVirtualDisplay.anyDisplayIsMirroring() {
+            print("! Displays are mirroring; HoloFrame needs an extended desktop.")
+            guard HFVirtualDisplay.disableAllMirroring() else {
+                print("  FAILED — turn mirroring off in System Settings > Displays and replug.")
+                state = .waiting
+                showWaitingWindow(message: "Turn display mirroring off to use HoloFrame.")
+                return
+            }
+            print("  released all displays from mirroring.")
+            // The reconfiguration takes a moment to settle, and building the canvas into a
+            // half-applied arrangement is its own source of misplaced windows.
+            DispatchQueue.main.asyncAfter(deadline: .now() + 3.0) { [weak self] in
+                guard let self, self.state == .activating, self.canvas == nil else { return }
+                self.state = .waiting
+                if Self.findGlassesDisplay() != nil { self.beginActivation() }
+            }
+            return
+        }
 
         guard let canvas = HFVirtualDisplay(width: canvasWidth, height: canvasHeight,
                                             hiDPI: false, serialNumber: canvasSerial,
@@ -290,11 +348,22 @@ final class AppController {
         guard let canvas else { return }
         print("  canvas \(canvasID): \(Int(canvas.currentPixelSize.width)) x \(Int(canvas.currentPixelSize.height))")
 
+        // Render on the GPU that draws the CANVAS, not the one driving the glasses.
+        //
+        // On a dual-GPU Mac they differ: the virtual canvas is composited on the integrated
+        // GPU while the glasses hang off the discrete one. Every captured frame lives on the
+        // canvas's GPU, and sampling it from the other means moving a 66 MB IOSurface across
+        // the bus up to 60 times a second — which is what pinned WindowServer at a full core
+        // and heated the machine until input itself turned sluggish. Rendered here instead,
+        // only the finished glasses frame crosses over, and that is a tenth of the size.
         guard let glassesID = Self.findGlassesDisplay(),
-              let metalDevice = CGDirectDisplayCopyCurrentMetalDevice(glassesID) else {
+              let metalDevice = (Diagnostics.renderOnGlassesGPU
+                                    ? nil : CGDirectDisplayCopyCurrentMetalDevice(canvasID))
+                ?? CGDirectDisplayCopyCurrentMetalDevice(glassesID) else {
             cancelActivation()
             return
         }
+        print("  rendering on \(metalDevice.name)")
 
         // 3. IMU. Optional — without it the view simply does not pan.
         connectGlassesHID()
@@ -326,6 +395,7 @@ final class AppController {
 
         activeGlassesID = glassesID
         state = .active
+        gestures?.isActive = true
         idlePaused = false
         startCapture(canvasID: canvasID)
 
@@ -346,6 +416,7 @@ final class AppController {
         func step(_ name: String) { if trace { print("    teardown: \(name)") } }
 
         activeGlassesID = nil
+        gestures?.isActive = false
         step("cursor");   cursor?.stop(); cursor = nil
         step("view");     view?.hideNow(); view?.stop(); view = nil
         step("capture");  capture?.stop(); capture = nil
@@ -368,13 +439,19 @@ final class AppController {
         guard glasses == nil else { return }
         do {
             let device = try XRealDevice()
+            let recorder = Diagnostics.recordPath.flatMap { IMURecorder(path: $0) }
             try device.startIMU { [weak self] sample in
                 self?.tracker.integrate(sample)
                 self?.sampleTap.feed(sample)
+                recorder?.record(sample)
             }
             // The temple buttons. Logged before they are bound to anything, because the
             // inbound message format is inferred from the outbound one and wants proof.
-            device.startButtons { [weak self] msgid, _ in
+            device.startButtons { [weak self] msgid, data in
+                if Diagnostics.statsInterval != nil, msgid != 0x6C02 {
+                    print(String(format: "  mcu 0x%04X ", msgid)
+                          + data.prefix(12).map { String(format: "%02x", $0) }.joined(separator: " "))
+                }
                 guard msgid == 0x6C05 || msgid == 0x6C04 else { return }
                 self?.recentreNow("glasses button")
             }
@@ -388,15 +465,20 @@ final class AppController {
 
     private func startCapture(canvasID: CGDirectDisplayID) {
         guard let capture else { return }
+        guard !Diagnostics.disableCapture else {
+            print("  capture disabled (HOLOFRAME_NO_CAPTURE)\n")
+            return
+        }
         if !CGPreflightScreenCaptureAccess() {
             print("  Screen Recording: requesting — approve the dialog macOS is showing")
             _ = CGRequestScreenCaptureAccess()
         }
+        let frameRate = Diagnostics.captureFrameRate ?? settings.captureFrameRate
         Task { [weak self] in
             var announced = false
             while self?.state == .active {
                 do {
-                    try await capture.start(displayID: canvasID)
+                    try await capture.start(displayID: canvasID, frameRate: frameRate)
                     print("  capturing canvas\n")
                     return
                 } catch {
@@ -417,6 +499,9 @@ final class AppController {
                 self.settings = updated
                 self.view?.apply(updated)     // live, while you are wearing them
                 self.cursor?.apply(updated)
+                if Diagnostics.captureFrameRate == nil {
+                    self.capture?.setFrameRate(updated.captureFrameRate)
+                }
             }
         }
         settingsWindow?.show()
@@ -435,6 +520,36 @@ final class AppController {
     private func startHousekeeping() {
         Timer.scheduledTimer(withTimeInterval: 2.0, repeats: true) { [weak self] _ in
             self?.tick()
+        }
+        startStats()
+    }
+
+    /// Periodic numbers for HOLOFRAME_STATS. Rates are over the interval just ended.
+    private func startStats() {
+        guard let interval = Diagnostics.statsInterval else { return }
+        var last = (time: CACurrentMediaTime(), frames: 0, captured: 0, render: 0.0, warps: 0, skipped: 0)
+        Timer.scheduledTimer(withTimeInterval: interval, repeats: true) { [weak self] _ in
+            guard let self, self.state == .active, let view = self.view,
+                  let capture = self.capture else { return }
+            let now = CACurrentMediaTime()
+            let span = max(now - last.time, 0.001)
+            let frames = view.framesDrawn, captured = capture.frameCount
+            let render = view.renderSeconds, warps = self.cursor?.warpCount ?? 0
+            let drawn = max(frames - last.frames, 1)
+            let pose = self.tracker.diagnostics
+            let anchor = self.tracker.magneticStatus
+            print(String(format: "  stats render %.1f fps %.2f ms (skipped %.1f/s) · capture %.1f fps · warps %.1f/s"
+                         + " · yaw %+.2f pitch %+.2f · bias %+.3f %+.3f %+.3f%@ · mag %@ %+.2f",
+                         Double(frames - last.frames) / span,
+                         (render - last.render) / Double(drawn) * 1000,
+                         Double(view.framesSkipped - last.skipped) / span,
+                         Double(captured - last.captured) / span,
+                         Double(warps - last.warps) / span,
+                         pose.yaw, pose.pitch, pose.bias.x, pose.bias.y, pose.bias.z,
+                         pose.calibrated ? "" : " (uncal)",
+                         anchor.locked ? (anchor.accepted ? "ok" : "REJ") : "off",
+                         anchor.error))
+            last = (now, frames, captured, render, warps, view.framesSkipped)
         }
     }
 
@@ -458,7 +573,7 @@ final class AppController {
         // Idle: the glasses have no wear sensor we know of, so prolonged stillness stands
         // in for "taken off". Pausing drops the cost to nothing without disturbing the
         // desktop — the canvas stays, so windows are not scattered.
-        if settings.idleTimeoutSeconds > 0, glasses != nil {
+        if settings.idleTimeoutSeconds > 0, glasses != nil, !Diagnostics.simulateMotion {
             let idle = tracker.idleSeconds
             if !idlePaused, idle > settings.idleTimeoutSeconds {
                 idlePaused = true
@@ -474,6 +589,7 @@ final class AppController {
         }
 
         reportMagneticAnchor()
+        saveBiasIfUpdated()
 
         // Accessibility can appear at any moment, and just as easily from System Settings
         // as from our own prompt — macOS sends no notification either way. Watching for it
@@ -482,8 +598,8 @@ final class AppController {
         // only ever noticed a grant that followed its own prompt, so permitting HoloFrame
         // directly in System Settings looked exactly like the feature being broken. One
         // function call a second, and the whole failure mode goes away.
-        if pinchZoom?.isRunning != true, PinchZoom.isPermitted {
-            startPinchZoom()
+        if gestures?.isRunning != true, TrackpadGestures.isPermitted {
+            startGestures()
         }
 
         let size = canvas?.currentPixelSize ?? .zero

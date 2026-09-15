@@ -2,15 +2,20 @@
 //  HeadTracker.swift — 3DoF orientation from the glasses' IMU.
 //
 //  A complementary filter: integrate the gyro for responsiveness, and lean on gravity to
-//  stop pitch and roll drifting. Yaw has no such reference and *will* drift — the
-//  magnetometer is not trustworthy this close to a laptop — so the defences are gyro-bias
-//  estimation while you sit still, plus an explicit recentre.
+//  stop pitch and roll drifting. Yaw has no such reference, so its defences are an accurate
+//  gyro bias, a magnetic anchor that bounds what is left, and an explicit recentre.
 //
-//  Bias estimation is the single highest-value part. The glasses read roughly
-//  (+0.55, -0.80, -0.72) deg/s at rest; left uncorrected that is over 45 degrees of yaw
-//  drift per minute. Subtracting a measured bias removes nearly all of it — and a deadband
-//  on the remainder removes nearly all of what is left, because an estimate good to a
-//  hundredth of a deg/s still walks the canvas away from you over several minutes.
+//  Bias is the single highest-value part. The glasses read roughly (+0.85, +0.57, -0.74)
+//  deg/s at rest; left uncorrected that is over 45 degrees of yaw drift per minute. Three
+//  things keep the estimate honest, each found by replaying real recordings of the sensor
+//  with a scripted head of known orientation (Tools/bench/drift-sim):
+//
+//    * it is only learned from windows that are still like a DESK, not still like a head —
+//      a head's sway averaged into the estimate was worth over 80 degrees in four minutes;
+//    * it is remembered between launches, because the first estimate is the fragile one
+//      and this sensor's bias barely moves from one session to the next;
+//    * the magnetic anchor corrects the bias itself, not just the heading, so whatever error
+//      remains is removed rather than chased.
 //
 
 import Foundation
@@ -19,6 +24,19 @@ import simd
 final class HeadTracker {
 
     // MARK: tuning
+
+    /// The parameters worth varying when testing the filter offline against recorded data.
+    /// The defaults are what ships; each is documented where it is used below.
+    struct Tuning {
+        var stillnessRateThreshold = 1.0
+        var stillnessNoiseLimit = 0.3
+        var driftDeadband = 0.15
+        var magSlowRate = 0.05
+        var magFastRate = 2.0
+        var magGain = 0.1
+        var magBiasGain = 0.02
+    }
+    private let tuning: Tuning
 
     /// How strongly gravity pulls pitch/roll back per second. Higher tracks gravity
     /// faster but makes the view swim under linear acceleration.
@@ -34,7 +52,7 @@ final class HeadTracker {
     // turn slowly to follow it, your turn is learned as bias, and the drift grows. The
     // symptom is drift that worsens the longer you sit still rather than settling.
     /// A sample only counts as still below this bias-corrected rate, in deg/s.
-    private let stillnessRateThreshold = 1.0
+    private var stillnessRateThreshold: Double { tuning.stillnessRateThreshold }
     /// Before any bias is known the corrected rate *is* the raw rate — around 1.2 deg/s on
     /// these glasses — so the first estimate needs a looser gate or it is never made.
     private let initialStillnessThreshold = 2.5
@@ -48,9 +66,16 @@ final class HeadTracker {
     /// Whatever bias survives estimation still integrates, and 0.05 deg/s left running for
     /// three minutes is nine degrees of canvas walking away from you. Scaling the rate by
     /// speed²/(speed² + deadband²) leaves the rotation *axis* untouched and only ever
-    /// touches the angle: it approaches unity the moment you genuinely move — 2% down at
-    /// 3 deg/s, 0.2% at 10 — while crushing what sits near zero by two orders of magnitude.
-    private let driftDeadband = 0.4
+    /// touches the angle, crushing what sits near zero.
+    ///
+    /// It is not free, and it used to be 0.4. The loss depends on speed, so it does not
+    /// cancel: reading drifts slowly along a line and snaps back fast, losing a larger share
+    /// of the slow half every time. Replayed against real sensor data, a reading head lost
+    /// 14 degrees in six minutes at 0.4 and 2 at 0.15 — the view creeping sideways while you
+    /// read. Now that bias is remembered between sessions and corrected by the magnetic
+    /// anchor, far less residual bias reaches this point, so it can afford to be small: 2%
+    /// off at 1 deg/s, a quarter of a percent at 3.
+    private var driftDeadband: Double { tuning.driftDeadband }
 
     // --- magnetic anchor ---
     //
@@ -78,11 +103,11 @@ final class HeadTracker {
     private let magDeadzone = 0.5
     /// Correction authority while still, deg/s. Small enough to be invisible: at 48 px per
     /// degree this is under three pixels a second.
-    private let magSlowRate = 0.05
+    private var magSlowRate: Double { tuning.magSlowRate }
     /// ...and while the head is moving, where a correction is hidden by the motion itself.
-    private let magFastRate = 2.0
+    private var magFastRate: Double { tuning.magFastRate }
     /// Proportional gain, per second. The caps above do most of the shaping.
-    private let magGain = 0.1
+    private var magGain: Double { tuning.magGain }
 
 
     // MARK: state
@@ -93,8 +118,9 @@ final class HeadTracker {
     /// nodding rotates the view instead of panning it.
     private var axes: AxisMap
 
-    init(axes: AxisMap = AxisMap.load() ?? .identity) {
+    init(axes: AxisMap = AxisMap.load() ?? .identity, tuning: Tuning = Tuning()) {
         self.axes = axes
+        self.tuning = tuning
     }
 
     /// Adopt a freshly measured mapping without restarting. The old orientation was built
@@ -109,6 +135,8 @@ final class HeadTracker {
         pitchOffset = 0
         gyroBias = .zero
         biasAccumulator = .zero
+        biasSquares = .zero
+        deskBiasEstimate = nil
         stillSamples = 0
         calibrated = false
         lastTimestamp = 0
@@ -129,6 +157,10 @@ final class HeadTracker {
     private var q = simd_quatd(ix: 0, iy: 0, iz: 0, r: 1)
     private var gyroBias = SIMD3<Double>.zero
     private var biasAccumulator = SIMD3<Double>.zero
+    private var biasSquares = SIMD3<Double>.zero
+    /// The bias as of the last window that was still like a desk, and so trustworthy
+    /// enough to remember for next launch.
+    private var deskBiasEstimate: SIMD3<Double>?
     private var stillSamples = 0
     private var calibrated = false
     private var lastTimestamp: UInt64 = 0
@@ -146,6 +178,33 @@ final class HeadTracker {
 
     /// Set false to fly on gyro and gravity alone.
     var magneticAnchorEnabled = true
+
+    /// The magnetometer's own offset, in gauss, in the head frame: the field of the magnets
+    /// inside the glasses, which turns with them. Nil means uncalibrated, and then the anchor
+    /// does not run at all.
+    ///
+    /// That is not caution for its own sake. Fitted from real recordings of the glasses being
+    /// turned through many orientations, this offset measured about 0.25 G — against a true
+    /// field of about 0.16 G. An offset larger than the thing being measured bends the
+    /// apparent heading by tens of degrees depending on where you face, and the anchor then
+    /// pulls the view toward a heading that is simply wrong: logged at 23-32 degrees of
+    /// "error" on a head that had not drifted, and felt as the canvas turning steadily away.
+    private var hardIronOffset: SIMD3<Double>?
+
+    /// Adopt a measured magnetometer offset (or nil to switch the anchor off). The anchor is
+    /// re-learned, because a reference recorded through the old offset is meaningless.
+    func setHardIronOffset(_ offset: SIMD3<Double>?) {
+        lock.lock()
+        defer { lock.unlock() }
+        hardIronOffset = offset
+        magReference = nil
+        magAccumulator = .zero
+        magStrengthAccumulator = 0
+        magInclinationAccumulator = 0
+        magSamples = 0
+        magAccepted = false
+        magError = 0
+    }
     /// Unit field direction in the world frame, once learned. Nil means still learning, or
     /// that the field was too incoherent to anchor to — in which case nothing below runs
     /// and the tracker behaves exactly as it did before.
@@ -284,32 +343,63 @@ final class HeadTracker {
         guard still else {
             stillSamples = 0
             biasAccumulator = .zero
+            biasSquares = .zero
             return
         }
         // Raw, not corrected: bias is an absolute zero-offset, not an adjustment to the
         // estimate we already hold.
         biasAccumulator += s.gyro
+        biasSquares += s.gyro * s.gyro
         stillSamples += 1
         guard stillSamples >= samplesToCalibrate else { return }
 
         let measured = biasAccumulator / Double(stillSamples)
+
+        // Still means still like a desk, not still like a head.
+        //
+        // The rate gate above asks whether the window's AVERAGE is small, and a head that is
+        // holding still passes it: the small involuntary sway of breathing, pulse and posture
+        // is well under a degree per second. But a two-second slice of that sway does not
+        // average to zero, and every accepted window taught the estimate a few tenths of a
+        // deg/s of genuine head motion as though it were sensor offset. That residual then
+        // integrated without end. Replayed against real sensor data with a scripted head, a
+        // gently swaying head drifted over 80 degrees in four minutes while an unmoving one
+        // drifted none — which is the "yaw keeps moving the longer I wear them" symptom.
+        //
+        // Sway is visible in the SPREAD of the samples even when their mean is small; sensor
+        // noise on a desk is several times tighter than any head. So once a first estimate
+        // exists, a window is only learned from if its spread looks like noise. The first
+        // estimate keeps the loose gate, so glasses plugged in while already on your face
+        // still calibrate — anything is better than the raw bias, which walks over a degree
+        // a second.
+        let variance = biasSquares / Double(stillSamples) - measured * measured
+        let spread = (max(variance.x, 0) + max(variance.y, 0) + max(variance.z, 0)).squareRoot()
+        guard !calibrated || spread < tuning.stillnessNoiseLimit else {
+            stillSamples = 0
+            biasAccumulator = .zero
+            biasSquares = .zero
+            return
+        }
         // Ease toward the new estimate rather than snapping, so a marginal window cannot
         // jolt the view. Heavier than it looks: windows are two seconds and the gate now
         // keeps deliberate motion out of them, so each one is worth leaning on.
         gyroBias = calibrated ? simd_mix(gyroBias, measured, SIMD3(repeating: 0.25)) : measured
         calibrated = true
+        if spread < tuning.stillnessNoiseLimit { deskBiasEstimate = gyroBias }
         stillSamples = 0
         biasAccumulator = .zero
+        biasSquares = .zero
         secondsSinceBiasUpdate = 0
     }
 
     /// Nudge yaw back toward the magnetic anchor. Called with the lock held.
     private func updateMagneticAnchor(_ s: IMUSample, dt: Double) {
-        guard magneticAnchorEnabled, seeded else { return }
-        let strength = simd_length(s.mag)
+        guard magneticAnchorEnabled, seeded, let hardIronOffset else { return }
+        let field = s.mag - hardIronOffset
+        let strength = simd_length(field)
         guard strength > 1e-9 else { return }
 
-        let world = q.act(s.mag / strength)
+        let world = q.act(field / strength)
         let horizontal = simd_length(SIMD2(world.x, world.y))
         // A near-vertical field carries almost no heading: the horizontal component is
         // what encodes yaw, and dividing by one this small amplifies noise without bound.
@@ -364,6 +454,25 @@ final class HeadTracker {
         while error > .pi { error -= 2 * .pi }
         while error < -.pi { error += 2 * .pi }
         magError = error * 180 / .pi
+
+        // The anchor also corrects the BIAS, not only the heading.
+        //
+        // Nudging the heading alone cannot keep up with a bias that is off: the correction
+        // is capped at a crawl while you hold still, so that it stays invisible, and a bias
+        // error of a few tenths of a deg/s outruns it — the view slides steadily and the
+        // anchor trails behind. A persistent heading error IS a measurement of that bias
+        // error, so folding a little of it into the bias removes the cause rather than
+        // chasing the symptom. This is the integral half of a PI controller; the heading
+        // nudge below is the proportional half. It is slew-limited, because a field that is
+        // subtly wrong in some directions — the glasses' own speaker magnets — would
+        // otherwise be able to teach it something wrong quickly.
+        if tuning.magBiasGain > 0 {
+            let vertical = q.inverse.act(SIMD3<Double>(0, 0, 1))
+            let maxSlew = 0.02                                   // deg/s of bias per second
+            let adjust = max(-maxSlew, min(maxSlew, tuning.magBiasGain * magError)) * dt
+            gyroBias -= vertical * adjust
+        }
+
         guard abs(magError) > magDeadzone else { return }
 
         // Correct faster while the head is moving. A degree per second of yaw correction is
@@ -393,6 +502,42 @@ final class HeadTracker {
         lock.lock()
         defer { lock.unlock() }
         return (magReference != nil, magAccepted, magError, magFailures)
+    }
+
+    /// Raw yaw and pitch in degrees, WITHOUT the recentre offsets, plus the bias estimate.
+    /// For watching drift: a recentre would otherwise show up as a jump.
+    var diagnostics: (yaw: Double, pitch: Double, bias: SIMD3<Double>, calibrated: Bool) {
+        lock.lock()
+        let o = q, bias = gyroBias, known = calibrated
+        lock.unlock()
+        let w = o.real, x = o.imag.x, y = o.imag.y, z = o.imag.z
+        let yaw = atan2(2 * (w * z + x * y), 1 - 2 * (y * y + z * z)) * 180 / .pi
+        let pitch = -asin(max(-1, min(1, 2 * (w * y - z * x)))) * 180 / .pi
+        return (yaw, pitch, bias, known)
+    }
+
+    /// Start from a bias measured in an earlier session instead of estimating one now.
+    ///
+    /// The first estimate is the fragile one. It has to be allowed with a loose stillness
+    /// test, or glasses plugged in while already being worn would never calibrate at all —
+    /// and a head is never still, so a first estimate taken on one soaks up its sway and
+    /// keeps it for good. This sensor's bias barely moves between sessions, so the value
+    /// from the last time the glasses lay on a desk is a far better start than anything
+    /// measurable on a face. Ignored if an estimate already exists.
+    func preset(bias: SIMD3<Double>) {
+        lock.lock()
+        defer { lock.unlock() }
+        guard !calibrated else { return }
+        gyroBias = bias
+        calibrated = true
+        secondsSinceBiasUpdate = 0
+    }
+
+    /// The most recent desk-quality bias, for remembering across launches.
+    var deskBias: SIMD3<Double>? {
+        lock.lock()
+        defer { lock.unlock() }
+        return deskBiasEstimate
     }
 
     var isBiasCalibrated: Bool {
@@ -490,5 +635,32 @@ final class HeadTracker {
         yawOffset = yaw
         pitchOffset = -pitchDown
         lock.unlock()
+    }
+}
+
+/// The gyro bias from the last time the glasses lay still, remembered across launches. Tied
+/// to the axis mapping it was measured under, because the bias is stored in the head frame
+/// and means nothing under a different one.
+enum StoredGyroBias {
+    private struct Record: Codable {
+        var axes: String
+        var bias: [Double]
+        var saved: Date
+    }
+
+    private static var url: URL {
+        AxisMap.storeURL.deletingLastPathComponent().appendingPathComponent("gyro-bias.json")
+    }
+
+    static func load(for axes: AxisMap) -> SIMD3<Double>? {
+        guard let data = try? Data(contentsOf: url),
+              let record = try? JSONDecoder().decode(Record.self, from: data),
+              record.axes == axes.summary, record.bias.count == 3 else { return nil }
+        return SIMD3(record.bias[0], record.bias[1], record.bias[2])
+    }
+
+    static func save(_ bias: SIMD3<Double>, for axes: AxisMap) {
+        let record = Record(axes: axes.summary, bias: [bias.x, bias.y, bias.z], saved: Date())
+        if let data = try? JSONEncoder().encode(record) { try? data.write(to: url) }
     }
 }

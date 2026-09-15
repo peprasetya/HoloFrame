@@ -66,7 +66,20 @@ final class DesktopCapture: NSObject, SCStreamOutput {
         return latest
     }
 
-    func start(displayID: CGDirectDisplayID) async throws {
+    private var configuration: SCStreamConfiguration?
+
+    /// Change the capture rate on a running stream, for the settings slider.
+    func setFrameRate(_ rate: Double) {
+        guard let stream, let configuration else { return }
+        configuration.minimumFrameInterval = Self.interval(for: rate)
+        stream.updateConfiguration(configuration) { _ in }
+    }
+
+    private static func interval(for rate: Double) -> CMTime {
+        CMTime(value: 1, timescale: CMTimeScale(min(max(rate, 1), 60).rounded()))
+    }
+
+    func start(displayID: CGDirectDisplayID, frameRate: Double) async throws {
         let content: SCShareableContent
         do {
             content = try await SCShareableContent.excludingDesktopWindows(false,
@@ -85,11 +98,11 @@ final class DesktopCapture: NSObject, SCStreamOutput {
         config.width = display.width
         config.height = display.height
         config.pixelFormat = kCVPixelFormatType_32BGRA
-        config.showsCursor = true
+        config.showsCursor = Diagnostics.captureCursor
         config.queueDepth = 3
-        // Cap the delivery rate; the display is 60 Hz and there is nothing to gain above
-        // it. SCK still only sends frames when something actually changed.
-        config.minimumFrameInterval = CMTime(value: 1, timescale: 60)
+        // Cap the delivery rate; the canvas is 60 Hz and there is nothing to gain above it.
+        // SCK still only sends frames when something actually changed.
+        config.minimumFrameInterval = Self.interval(for: frameRate)
 
         let stream = SCStream(filter: filter, configuration: config, delegate: nil)
         try stream.addStreamOutput(self, type: .screen,
@@ -97,6 +110,7 @@ final class DesktopCapture: NSObject, SCStreamOutput {
                                                                      qos: .userInteractive))
         try await stream.startCapture()
         self.stream = stream
+        self.configuration = config
     }
 
     func stop() {

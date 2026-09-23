@@ -40,6 +40,7 @@ final class AppController {
     private var capture: DesktopCapture?
     private var view: GlassesDisplay?
     private var cursor: CursorManager?
+    private var renderDevice: MTLDevice?
 
     // Outlive the glasses: the IMU connection is re-established on demand, but the tracker
     // keeps its calibration and bias estimate.
@@ -47,7 +48,6 @@ final class AppController {
     private let sampleTap = SampleTap()
     private var glasses: XRealDevice?
     private var statusItem: StatusItem?
-    private var waitingWindow: NSWindow?
     private var recenterHotKey: HotKey?
     private var gestures: TrackpadGestures?
     private var needsCalibration: Bool
@@ -84,8 +84,8 @@ final class AppController {
 
     /// Remember a desk-quality bias for next launch. At most once a minute: on a desk a new
     /// estimate arrives every couple of seconds, and none of them is worth a write.
-    private func saveBiasIfUpdated() {
-        guard Date().timeIntervalSince(lastBiasSave) > 60,
+    private func saveBiasIfUpdated(force: Bool = false) {
+        guard force || Date().timeIntervalSince(lastBiasSave) > 60,
               let bias = tracker.deskBias, bias != lastSavedBias,
               let axes = AxisMap.load() else { return }
         StoredGyroBias.save(bias, for: axes)
@@ -176,6 +176,9 @@ final class AppController {
 
         startGestures()
 
+        // Already plugged in at launch: nothing is settling, so there is no reason to wait.
+        if Self.findGlassesDisplay() != nil { glassesSeenAt = .distantPast }
+
         // React to the glasses being plugged in or pulled out.
         CGDisplayRegisterReconfigurationCallback({ display, flags, context in
             guard let context else { return }
@@ -200,25 +203,131 @@ final class AppController {
             self?.evaluate()
         }
 
+        // Replaced by a status line the moment the glasses turn up.
+        statusItem?.setNote(Self.waitingNote)
         evaluate()
         startHousekeeping()
     }
 
+    /// When the glasses display was first seen in the current unbroken run of sightings.
+    private var glassesSeenAt: Date?
+
+    /// How long a freshly plugged-in display must stay put before we build on it. Right
+    /// after plugging in, macOS is still applying the remembered arrangement and the
+    /// glasses are still choosing a mode, and the USB interfaces for the IMU can trail the
+    /// display by a moment. A window placed into that lands wherever the display was a
+    /// fraction of a second ago.
+    private let settleSeconds: TimeInterval = 1.5
+
+    /// Set while the view is being rebuilt; view.start() spins the run loop, and the
+    /// periodic check must not pile a second rebuild on top.
+    private var rebuildingView = false
+
     /// Bring the app in line with whether the glasses are present.
     private func evaluate() {
+        guard !rebuildingView else { return }
         let present = Self.findGlassesDisplay() != nil
+        glassesSeenAt = present ? (glassesSeenAt ?? Date()) : nil
+
         switch (state, present) {
-        case (.waiting, true): beginActivation()
+        case (.waiting, true):
+            let settled = Date().timeIntervalSince(glassesSeenAt ?? .distantPast)
+            if settled >= settleSeconds {
+                beginActivation()
+            } else {
+                DispatchQueue.main.asyncAfter(deadline: .now() + settleSeconds - settled + 0.05) {
+                    [weak self] in self?.evaluate()
+                }
+            }
         case (.activating, false): cancelActivation()
-        case (.active, false): deactivate(reason: "glasses unplugged")
+        case (.active, false):
+            deactivate(reason: "glasses unplugged")
+            relaunchForNextPlugIn()
+        case (.active, true) where view?.isLost ?? false:
+            // The view took itself off the glasses, yet the glasses are still here: a fast
+            // replug, a mode change, the USB side dropping out and coming back. Sitting in
+            // .active with no window is what left the glasses showing the plain desktop
+            // until HoloFrame was restarted.
+            //
+            // Not at once, though. Unplugging drops the USB side a moment before the
+            // display, and rebuilding onto a display on its way out would be wasted work.
+            let lostAt = viewLostAt ?? Date()
+            viewLostAt = lostAt
+            let waited = Date().timeIntervalSince(lostAt)
+            if waited >= settleSeconds {
+                viewLostAt = nil
+                rebuildView()
+            } else {
+                DispatchQueue.main.asyncAfter(deadline: .now() + settleSeconds - waited + 0.05) {
+                    [weak self] in self?.evaluate()
+                }
+            }
         default: break
         }
+    }
+
+    /// When the view was first found lost while the glasses were still present.
+    private var viewLostAt: Date?
+
+    private var rebuilds: [Date] = []
+
+    /// Put a fresh view on the glasses without touching the canvas, so windows on it stay
+    /// exactly where they are.
+    private func rebuildView() {
+        guard state == .active, let canvasID = canvas?.displayID, let renderDevice,
+              let glassesID = Self.findGlassesDisplay() else { return }
+
+        // A display that keeps pulling the window away is not going to be fixed by putting
+        // it back again. Start over from nothing — once it has settled.
+        rebuilds = rebuilds.filter { $0.timeIntervalSinceNow > -30 } + [Date()]
+        if rebuilds.count > 3 {
+            print("  the view keeps losing the glasses — restarting from scratch")
+            rebuilds = []
+            deactivate(reason: nil)
+            glassesSeenAt = Date()
+            return
+        }
+
+        print("\nThe view lost the glasses display while they were still connected — putting it back.")
+        rebuildingView = true
+        defer { rebuildingView = false }
+        cursor?.stop(); cursor = nil
+        view?.stop(); view = nil
+        connectGlassesHID()
+        do {
+            try startView(glassesID: glassesID, canvasID: canvasID, device: renderDevice)
+        } catch {
+            print("  \(error)")
+            deactivate(reason: nil)
+            glassesSeenAt = Date()
+        }
+    }
+
+    /// The renderer and the pointer keeper, which both belong to one particular glasses
+    /// display. The canvas and the capture outlive them.
+    private func startView(glassesID: CGDirectDisplayID, canvasID: CGDirectDisplayID,
+                           device: MTLDevice) throws {
+        guard let capture else { return }
+        let view = try GlassesDisplay(glassesDisplayID: glassesID, capture: capture,
+                                      tracker: tracker, config: settings, device: device)
+        try view.start(on: glassesID)
+        // The renderer notices the display vanishing before any system callback we get,
+        // because it is watching its own window rather than waiting to be told.
+        view.onDisplayLost = { [weak self] in
+            DispatchQueue.main.async { self?.evaluate() }
+        }
+        self.view = view
+        activeGlassesID = glassesID
+
+        cursor = CursorManager(canvasID: canvasID, builtInID: Self.findBuiltInDisplay(),
+                               glassesID: glassesID, display: view, settings: settings)
+        cursor?.start()
     }
 
     private func beginActivation() {
         guard state == .waiting else { return }
         print("\nGlasses detected — starting up.")
-        hideWaitingWindow()
+        statusItem?.setNote(nil)
         state = .activating
 
         // Mirroring makes a perfectly good display look broken in a dozen misleading ways:
@@ -234,7 +343,7 @@ final class AppController {
             guard HFVirtualDisplay.disableAllMirroring() else {
                 print("  FAILED — turn mirroring off in System Settings > Displays and replug.")
                 state = .waiting
-                showWaitingWindow(message: "Turn display mirroring off to use HoloFrame.")
+                statusItem?.setNote("Turn display mirroring off to use HoloFrame.")
                 return
             }
             print("  released all displays from mirroring.")
@@ -253,7 +362,7 @@ final class AppController {
                                             name: "HoloFrame Canvas") else {
             print("  failed to create the canvas — see virtualDisplay.md")
             state = .waiting
-            showWaitingWindow(message: "HoloFrame could not create its virtual display.")
+            statusItem?.setNote("HoloFrame could not create its virtual display.")
             return
         }
         self.canvas = canvas
@@ -300,7 +409,12 @@ final class AppController {
             guard let context else { return }
             let controller = Unmanaged<AppController>.fromOpaque(context).takeUnretainedValue()
             controller.view?.hideNow()
-            DispatchQueue.main.async { controller.evaluate() }
+            DispatchQueue.main.async {
+                // The IMU handle is dead whether or not the display follows it out. Dropping
+                // it lets the retry in tick() pick the device up again when it returns.
+                controller.dropIMU()
+                controller.evaluate()
+            }
         }, Unmanaged.passUnretained(self).toOpaque())
         IOHIDManagerScheduleWithRunLoop(manager, CFRunLoopGetMain(), CFRunLoopMode.defaultMode.rawValue)
         IOHIDManagerOpen(manager, IOOptionBits(kIOHIDOptionsTypeNone))
@@ -311,6 +425,7 @@ final class AppController {
         print("  glasses went away during startup.")
         canvas = nil
         state = .waiting
+        statusItem?.setNote(Self.waitingNote)
     }
 
     /// Poll from the main queue rather than a nested run loop. AppKit only refreshes
@@ -343,7 +458,7 @@ final class AppController {
             print("  canvas never became active")
             self.canvas = nil
             state = .waiting
-            showWaitingWindow(message: "HoloFrame could not create its virtual display.")
+            statusItem?.setNote("HoloFrame could not create its virtual display.")
         }
     }
 
@@ -373,30 +488,22 @@ final class AppController {
 
         // 4. Capture and render.
         do {
-            let capture = try DesktopCapture(device: metalDevice)
-            let view = try GlassesDisplay(glassesDisplayID: glassesID, capture: capture,
-                                          tracker: tracker, config: settings, device: metalDevice)
-            try view.start(on: glassesID)
-            // The renderer notices the display vanishing before any system callback we get,
-            // because it is watching its own window rather than waiting to be told.
-            view.onDisplayLost = { [weak self] in
-                DispatchQueue.main.async { self?.evaluate() }
-            }
-            self.capture = capture
-            self.view = view
+            capture = try DesktopCapture(device: metalDevice)
+            renderDevice = metalDevice
+            try startView(glassesID: glassesID, canvasID: canvasID, device: metalDevice)
         } catch {
             print("  \(error)")
-            self.canvas = nil
-            state = .waiting
-            showWaitingWindow(message: "HoloFrame could not start rendering:\n\(error)")
+            deactivate(reason: nil)
+            statusItem?.setNote("HoloFrame could not start rendering:\n\(error)")
+            return
+        }
+        // view.start() waits for AppKit with the run loop turning, and the glasses can be
+        // pulled out in that time. Building on a display that is gone helps nobody.
+        guard state == .activating, self.canvas != nil else {
+            deactivate(reason: nil)
             return
         }
 
-        cursor = CursorManager(canvasID: canvasID, builtInID: Self.findBuiltInDisplay(),
-                               glassesID: glassesID, display: view!, settings: settings)
-        cursor?.start()
-
-        activeGlassesID = glassesID
         state = .active
         gestures?.isActive = true
         idlePaused = false
@@ -410,7 +517,7 @@ final class AppController {
     }
 
     private func deactivate(reason: String?) {
-        guard state == .active || canvas != nil else { return }
+        guard state == .active || canvas != nil || view != nil else { return }
         if let reason { print("\n\(reason) — shutting the canvas down.") }
 
         // Traced step by step: an earlier version died somewhere in here with no crash
@@ -419,27 +526,85 @@ final class AppController {
         func step(_ name: String) { if trace { print("    teardown: \(name)") } }
 
         activeGlassesID = nil
+        viewLostAt = nil
         gestures?.isActive = false
         step("cursor");   cursor?.stop(); cursor = nil
         step("view");     view?.hideNow(); view?.stop(); view = nil
         step("capture");  capture?.stop(); capture = nil
         step("canvas");   canvas = nil     // releasing the object destroys the display
-        step("imu");      glasses?.stopButtons(); glasses?.stopIMU(); glasses = nil
+        step("imu");      dropIMU()
+        renderDevice = nil
         // Final sweep, independent of any reference we hold: whatever happened above, no
         // render window may remain visible after this point.
         step("sweep");    RenderWindow.closeAll()
         step("done")
         state = .waiting
 
-        if reason != nil {
-            showWaitingWindow(message: "Plug the XREAL glasses back in to continue.")
+        statusItem?.setNote(Self.waitingNote)
+    }
+
+    /// Start over as a fresh process, ready for the next time the glasses are plugged in.
+    ///
+    /// A display going away leaves state behind that no API hands back: the window server
+    /// keeps the old render window's surface, transparent and parked where macOS moved it,
+    /// for as long as the process lives — one more with every unplug. Everything else is
+    /// rebuilt on plug-in anyway, so a new process costs nothing and guarantees that the
+    /// second plug-in starts exactly like the first.
+    ///
+    /// Relaunched through `open`, never by exec'ing the binary: LaunchServices is what makes
+    /// macOS attribute Screen Recording and Accessibility to HoloFrame itself. The shell
+    /// waits for this process to be gone first, or `open` would just find it still running.
+    private func relaunchForNextPlugIn() {
+        let bundle = Bundle.main.bundleURL
+        guard bundle.pathExtension == "app" else {
+            print("  (not running from HoloFrame.app — staying up rather than relaunching)")
+            return
         }
+        saveBiasIfUpdated(force: true)
+
+        var args = ["-a", bundle.path]
+        // Keep writing to the same log, if there is one, and keep any diagnostics switches.
+        var buffer = [CChar](repeating: 0, count: Int(MAXPATHLEN))
+        if fcntl(STDOUT_FILENO, F_GETPATH, &buffer) != -1 {
+            let log = String(cString: buffer)
+            if log != "/dev/null" { args += ["--stdout", log, "--stderr", log] }
+        }
+        for (key, value) in ProcessInfo.processInfo.environment where key.hasPrefix("HOLOFRAME_") {
+            args += ["--env", "\(key)=\(value)"]
+        }
+
+        let relauncher = Process()
+        relauncher.executableURL = URL(fileURLWithPath: "/bin/sh")
+        relauncher.arguments = ["-c",
+            "while kill -0 \(getpid()) 2>/dev/null; do sleep 0.2; done; exec /usr/bin/open \"$@\"",
+            "sh"] + args
+        do {
+            try relauncher.run()
+        } catch {
+            print("  could not relaunch (\(error)) — staying up instead")
+            return
+        }
+        print("  restarting, so the next plug-in starts clean.")
+        exit(0)
+    }
+
+    static let waitingNote = "Plug in the XREAL glasses — HoloFrame starts on its own."
+
+    private func dropIMU() {
+        glasses?.stopButtons(); glasses?.stopIMU(); glasses = nil
     }
 
     // MARK: - pieces
 
+    private var lastIMUAttempt = Date.distantPast
+    private var imuFailureReported = false
+
+    /// Safe to call repeatedly: does nothing while connected, and after a failure only says
+    /// so once. The IMU interfaces can enumerate after the display does, and a first
+    /// attempt that finds nothing must not leave the view frozen for the whole session.
     private func connectGlassesHID() {
         guard glasses == nil else { return }
+        lastIMUAttempt = Date()
         do {
             let device = try XRealDevice()
             let recorder = Diagnostics.recordPath.flatMap { IMURecorder(path: $0) }
@@ -459,10 +624,13 @@ final class AppController {
                 self?.recentreNow("glasses button")
             }
             glasses = device
+            imuFailureReported = false
             print("  IMU streaming")
         } catch {
+            guard !imuFailureReported else { return }
+            imuFailureReported = true
             print("  \(error)")
-            print("  continuing without head tracking; the view will not pan.")
+            print("  no head tracking yet — the view will not pan until the IMU answers.")
         }
     }
 
@@ -569,6 +737,10 @@ final class AppController {
             return
         }
 
+        if glasses == nil, now.timeIntervalSince(lastIMUAttempt) > 2 {
+            connectGlassesHID()
+        }
+
         let frames = view.framesDrawn
         let fps = Double(frames - lastFrames) / elapsed
         lastFrames = frames
@@ -641,68 +813,5 @@ final class AppController {
             print(String(format: "  anchor: err %+.2f°  %@",
                          anchor.error, anchor.accepted ? "accepted" : "REJECTED (field moved)"))
         }
-    }
-
-    // MARK: - the waiting panel
-
-    private func showWaitingWindow(message: String) {
-        hideWaitingWindow()
-        guard let screen = NSScreen.main else { return }
-
-        let size = NSSize(width: 460, height: 150)
-        let frame = NSRect(x: screen.frame.midX - size.width / 2,
-                           y: screen.frame.midY - size.height / 2,
-                           width: size.width, height: size.height)
-        let panel = NSPanel(contentRect: frame,
-                            styleMask: [.titled, .closable, .utilityWindow],
-                            backing: .buffered, defer: false)
-        panel.title = "HoloFrame"
-        // Held in a strong property, so AppKit must not also release it on close — see the
-        // note in RenderWindow.
-        panel.isReleasedWhenClosed = false
-        panel.level = .floating
-        panel.isFloatingPanel = true
-        panel.hidesOnDeactivate = false
-
-        let label = NSTextField(wrappingLabelWithString: message)
-        label.font = .systemFont(ofSize: 13)
-        label.alignment = .center
-        label.translatesAutoresizingMaskIntoConstraints = false
-
-        let quit = NSButton(title: "Quit HoloFrame", target: self, action: #selector(quitFromPanel))
-        quit.bezelStyle = .rounded
-        quit.translatesAutoresizingMaskIntoConstraints = false
-
-        let content = NSView(frame: NSRect(origin: .zero, size: size))
-        content.addSubview(label)
-        content.addSubview(quit)
-        NSLayoutConstraint.activate([
-            label.centerXAnchor.constraint(equalTo: content.centerXAnchor),
-            label.topAnchor.constraint(equalTo: content.topAnchor, constant: 24),
-            label.widthAnchor.constraint(equalToConstant: size.width - 48),
-            quit.centerXAnchor.constraint(equalTo: content.centerXAnchor),
-            quit.bottomAnchor.constraint(equalTo: content.bottomAnchor, constant: -20),
-        ])
-        panel.contentView = content
-        panel.orderFrontRegardless()
-        waitingWindow = panel
-    }
-
-    @objc private func quitFromPanel() {
-        deactivate(reason: nil)
-        exit(0)
-    }
-
-    private func hideWaitingWindow() {
-        waitingWindow?.orderOut(nil)
-        waitingWindow = nil
-    }
-
-    /// Called at launch when there are no glasses at all, so the user gets an explanation
-    /// rather than an app that appears to do nothing.
-    func showInitialWaitingIfNeeded() {
-        guard state == .waiting else { return }
-        showWaitingWindow(message: "HoloFrame is waiting for XREAL glasses.\n"
-                          + "Plug them in and it will start automatically.")
     }
 }

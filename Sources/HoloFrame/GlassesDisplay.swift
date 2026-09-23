@@ -330,20 +330,28 @@ final class RenderWindow: NSWindow {
         orderOut(nil)
     }
 
-    /// The one render window this process ever creates.
-    ///
-    /// Reused rather than recreated per session. A closed NSWindow with
-    /// `isReleasedWhenClosed = false` is still retained by AppKit's window list, so making
-    /// a fresh one on every plug-in leaks one window per cycle — invisible, because
-    /// makeInvisible() zeroes its alpha, but accumulating for as long as the app runs.
-    /// One window, hidden and shown, has none of that.
+    /// The current render window, if any.
     private static var shared: RenderWindow?
 
+    /// A fresh render window for each session, the previous one closed.
+    ///
+    /// This used to reuse one window across sessions, to avoid leaking one per plug-in.
+    /// That window did not survive its display going away: macOS parks it on another
+    /// screen, and from then on AppKit and the window server disagree about it. AppKit
+    /// reports it on the glasses at full opacity; the window server keeps it transparent,
+    /// where it was parked. The glasses then show the bare desktop, and everything
+    /// HoloFrame can ask AppKit says all is well — which is why only relaunching fixed it.
+    /// Seen with CGWindowListCopyWindowInfo: alpha 0 at the canvas origin while AppKit
+    /// had it at the glasses' frame with alpha 1.
     static func obtain(frame: NSRect) -> RenderWindow {
         if let existing = shared {
-            existing.setFrame(frame, display: false)
-            existing.alphaValue = 1
-            return existing
+            // The window server keeps the old surface anyway — transparent, click-through,
+            // parked where macOS moved it — until the process exits. Neither close() nor
+            // ordering it in and out again removes it; both were tried. That is why
+            // unplugging relaunches the app (AppController.relaunchForNextPlugIn).
+            existing.makeInvisible()
+            existing.close()
+            shared = nil
         }
         let window = RenderWindow(contentRect: frame, styleMask: .borderless,
                                   backing: .buffered, defer: false)
@@ -444,9 +452,42 @@ final class GlassesDisplay: NSObject {
         return Self.screenID(screen) == glassesDisplayID
     }
 
+    /// True once the view has taken itself off the glasses — the display vanished, AppKit
+    /// moved the window, or someone called hideNow(). The controller treats a lost view on
+    /// a display that is still there as something to rebuild, not as a state to sit in.
+    var isLost: Bool { abandoned }
+
+    private var watchdogTicks = 0
+
+    /// Ask the window server itself, not AppKit, whether our window is where AppKit says:
+    /// on screen, opaque, and over the glasses. AppKit's view of a window can go stale
+    /// around display changes (see RenderWindow.obtain), and a stale view is invisible to
+    /// every AppKit-side check.
+    private func windowServerAgrees() -> Bool {
+        guard let window, window.windowNumber > 0,
+              let info = (CGWindowListCopyWindowInfo([.optionIncludingWindow],
+                                                      CGWindowID(window.windowNumber))
+                          as? [[String: Any]])?.first else { return false }
+        let onScreen = info[kCGWindowIsOnscreen as String] as? Bool ?? false
+        let alpha = info[kCGWindowAlpha as String] as? Double ?? 0
+        var bounds = CGRect.zero
+        if let dict = info[kCGWindowBounds as String] as? NSDictionary {
+            bounds = CGRect(dictionaryRepresentation: dict) ?? .zero
+        }
+        let display = CGDisplayBounds(glassesDisplayID)
+        return onScreen && alpha > 0.5 && bounds.intersection(display).width > display.width / 2
+    }
+
     private func checkDisplay() {
         guard !abandoned, window != nil else { return }
-        guard !displayStillPresent() else { return }
+        watchdogTicks += 1
+        // Once a second, after a second's grace for the window server to catch up with a
+        // window that was just placed.
+        let serverDisagrees = watchdogTicks > 10 && watchdogTicks % 10 == 0 && !windowServerAgrees()
+        if serverDisagrees {
+            print("  !! the window server does not have the view on the glasses")
+        }
+        guard !displayStillPresent() || serverDisagrees else { return }
         abandoned = true
         hideNow()
         onDisplayLost?()
@@ -460,6 +501,7 @@ final class GlassesDisplay: NSObject {
     /// callback, before AppKit gets the chance.
     func hideNow() {
         paused = true
+        abandoned = true
         onMain {
             self.watchdog?.invalidate()
             self.watchdog = nil
@@ -844,6 +886,7 @@ final class GlassesDisplay: NSObject {
         // compare — but bounds the window's time on the wrong screen to ~100 ms.
         self.glassesDisplayID = glassesDisplayID
         abandoned = false
+        watchdogTicks = 0
         let watchdog = Timer(timeInterval: 0.1, repeats: true) { [weak self] _ in
             self?.checkDisplay()
         }

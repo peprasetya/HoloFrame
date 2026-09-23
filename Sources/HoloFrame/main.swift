@@ -34,7 +34,6 @@ app.setActivationPolicy(.accessory)   // no Dock icon, never steals focus
 app.finishLaunching()
 
 controller.start()
-controller.showInitialWaitingIfNeeded()
 
 print("""
 

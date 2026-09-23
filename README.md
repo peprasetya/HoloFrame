@@ -95,12 +95,19 @@ If a grant ever gets stuck: `tccutil reset ScreenCapture id.prasetya.holoframe`,
 
 HoloFrame follows the glasses. Everything it creates is tied to them being present:
 
-- **No glasses at launch** — it waits, showing a panel on your main screen. No canvas is
-  created. Leaving a 7680×2160 display on the desktop with no way to see it would scatter
-  your windows across a screen you cannot look at.
+- **No glasses at launch** — it waits in the menu bar, icon dimmed, with a note in the menu
+  saying to plug them in. No canvas is created. Leaving a 7680×2160 display on the desktop
+  with no way to see it would scatter your windows across a screen you cannot look at.
 - **Unplugged while running** — the canvas is destroyed, capture and rendering stop, and
-  the desktop returns to normal. A panel offers to quit.
-- **Plugged back in** — it rebuilds automatically. Calibration is remembered.
+  the desktop returns to normal. HoloFrame then relaunches itself, so the next plug-in
+  starts exactly like the first: a display going away leaves an invisible window surface
+  behind in the window server that only ending the process clears.
+- **Plugged back in** — it rebuilds automatically, once the display has held still for
+  1.5 s: straight after plugging in, macOS is still applying the arrangement and the glasses
+  are still picking a mode. Calibration is remembered. If the view is ever knocked off the
+  glasses while they stay connected — a quick replug, a mode change, the USB side
+  re-enumerating — it is put back on its own; the head-tracking connection is likewise
+  retried until it answers.
 - **Mirroring** — the canvas needs an extended desktop, so display mirroring is switched off
   when the glasses connect. Only then: launching HoloFrame with no glasses attached leaves a
   mirrored projector or office display alone.

@@ -13,6 +13,11 @@ final class StatusItem {
 
     private let item: NSStatusItem
     private let statusLine = NSMenuItem(title: "", action: nil, keyEquivalent: "")
+    /// What to do next, when there is something to do — plugging the glasses in, or what
+    /// went wrong. Lives in the menu rather than a window of its own: the icon is always
+    /// there, and a panel floating over the desktop is one more thing to close.
+    private var noteItems: [NSMenuItem] = []
+    private let menu = NSMenu()
     private let accessibilityItem = NSMenuItem(title: "Enable Trackpad Zoom & Pan…",
                                                action: nil, keyEquivalent: "")
 
@@ -26,8 +31,6 @@ final class StatusItem {
         item.button?.image = NSImage(systemSymbolName: "eyeglasses",
                                      accessibilityDescription: "HoloFrame")
         item.button?.image?.isTemplate = true
-
-        let menu = NSMenu()
 
         statusLine.isEnabled = false
         menu.addItem(statusLine)
@@ -68,6 +71,24 @@ final class StatusItem {
     /// One line of live state at the top of the menu.
     func update(text: String) {
         statusLine.title = text
+    }
+
+    /// Show a note under the status line, or none. Multi-line text becomes one row per
+    /// line; the icon dims while there is nothing on the glasses.
+    func setNote(_ text: String?) {
+        for entry in noteItems { menu.removeItem(entry) }
+        noteItems = (text ?? "").split(separator: "\n").map { line in
+            let entry = NSMenuItem(title: "", action: nil, keyEquivalent: "")
+            entry.attributedTitle = NSAttributedString(string: String(line), attributes: [
+                .font: NSFont.menuFont(ofSize: NSFont.smallSystemFontSize),
+                .foregroundColor: NSColor.secondaryLabelColor,
+            ])
+            entry.isEnabled = false
+            return entry
+        }
+        let at = menu.index(of: statusLine) + 1
+        for (offset, entry) in noteItems.enumerated() { menu.insertItem(entry, at: at + offset) }
+        item.button?.appearsDisabled = text != nil
     }
 
     /// Offer the Accessibility prompt only while it would achieve something.
